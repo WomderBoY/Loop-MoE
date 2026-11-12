@@ -1,0 +1,13 @@
+# MoE 在 Looped Transformer 的 Expert 调度
+
+我的想法是将 MoE 的 Expert 调度，通过 Looped Transformer 特有的 Loop 信息，提高调度的效率，具体研究结论在 docs/research-note.md 中记录。
+
+目前需要设计实验做一些初步的研究，后面再根据实验结果探索具体的 idea.
+
+实验尽量参考已有论文的开源代码，复用超参数选择；在设计我们自己的方法时，再考虑进行参数调优。
+
+## 开发要求
+
+在当前 macbook 写代码，你可以在本机使用 conda 创建轻量环境做代码检查，但是不要在本机跑训练或推理。
+
+实验时在服务器上拉取代码仓库，配置环境并运行。可能会在 pku_A800 或 pku_pro5000 上运行（本机已配置好 ssh 免密连接）；也可能会在智星云/AutoDL等平台租用 GPU. 我需要你帮我写好 requirements.txt 和 README，给我明确的运行命令。
