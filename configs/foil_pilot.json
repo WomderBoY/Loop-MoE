@@ -1,0 +1,10 @@
+{
+  "repo": "ShourenWSR/how-to-loop-moe",
+  "revision": "b3d128b44cbefd54e2c8784224a110186c8931f1",
+  "models": ["Foil-1", "Foil-3"],
+  "prompts": "prompts_pilot.jsonl",
+  "max_new_tokens": 128,
+  "budgets_percent": [5, 10, 20, 40, 80, 100],
+  "score_alpha": 0.2,
+  "loop_bonus": 0.1
+}
