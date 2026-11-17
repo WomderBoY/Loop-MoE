@@ -59,7 +59,7 @@ bash scripts/run_pilot.sh runs/expanded --prompts /path/to/prompts.jsonl
 | `Loopie-6B` | [Loopie-6B-A0.6B-preview](https://huggingface.co/zitian-gao/Loopie-6B-A0.6B-preview)，BF16 | 18 个物理层，每层连续执行两次，每层 128 选 8 |
 | `Looped-MoE` | [1e18-d704-seed42](https://huggingface.co/ml-ryanlee/seedvar-looped-moe-1e18-d704-seed42)，FP32 | 8 层整块执行两轮，每层 8 选 2 |
 
-Loopie 使用模型的 chat template，按作者的 [vLLM 实现](https://github.com/zitian-gao/vllm/blob/9a9703d9918115cac2c6abfdb84aca411468c16c/vllm/model_executor/models/qwen3_moe.py) 在 Transformers 内重复调用同一个物理层。Looped-MoE 直接使用作者发布的模型代码和 checkpoint 精度。两者关闭 KV cache，每步重算前缀，采集真实 router 的 top-k。回放使用同一套策略和各模型专家权重的实际字节数。两个 checkpoint 合计约 15 GB，可先在不使用 GPU 的情况下下载。
+Loopie 使用模型的 chat template，按作者的 [vLLM 实现](https://github.com/zitian-gao/vllm/blob/9a9703d9918115cac2c6abfdb84aca411468c16c/vllm/model_executor/models/qwen3_moe.py) 在 Transformers 内重复调用同一个物理层。嵌入表和输出层按 checkpoint 中的 152,064 行加载，greedy decoding 使用发布配置声明的 151,936 个词表位置。Looped-MoE 直接使用作者发布的模型代码和 checkpoint 精度。两者关闭 KV cache，每步重算前缀，采集真实 router 的 top-k。回放使用同一套策略和各模型专家权重的实际字节数。两个 checkpoint 合计约 15 GB，可先在不使用 GPU 的情况下下载。
 
 ```bash
 export MOE_CONFIG=configs/loop_models_pilot.json
@@ -67,9 +67,10 @@ bash scripts/download_models.sh
 # 直连 Hugging Face 较慢时可用镜像，仍下载配置所固定的 revision
 HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 bash scripts/download_models.sh
 
-# 从 nvidia-smi 确认空闲卡后，填入该卡的编号或 UUID
-CUDA_VISIBLE_DEVICES=<空闲卡编号> bash scripts/run_pilot.sh runs/loop-smoke --limit 2 --max-new-tokens 4 --local-files-only
-CUDA_VISIBLE_DEVICES=<空闲卡编号> bash scripts/run_pilot.sh runs/loop-pilot --local-files-only
+# 从 nvidia-smi 确认空闲卡后，将示例编号 7 改为该卡的编号或 UUID
+GPU_ID=7
+CUDA_VISIBLE_DEVICES="$GPU_ID" bash scripts/run_pilot.sh runs/loop-smoke --limit 2 --max-new-tokens 4 --local-files-only
+CUDA_VISIBLE_DEVICES="$GPU_ID" bash scripts/run_pilot.sh runs/loop-pilot --local-files-only
 ```
 
 分析与回放可以脱离 GPU 单独运行，只用 Python 标准库。

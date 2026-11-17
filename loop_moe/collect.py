@@ -73,7 +73,7 @@ def capture_visits(torch, points, order, start, stop):
     return visits
 
 
-def collect_request(torch, model, tokenizer, prompt, order, forward, model_config, max_new_tokens):
+def collect_request(torch, model, tokenizer, prompt, order, forward, model_config, max_new_tokens, vocab_size):
     if model_config["architecture"] == "loopie":
         input_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt["text"]}], add_generation_prompt=True,
@@ -97,7 +97,7 @@ def collect_request(torch, model, tokenizer, prompt, order, forward, model_confi
     with torch.inference_mode():
         for step in range(max_new_tokens):
             output, points = forward(input_ids)
-            next_token = output.logits[:, -1, :].argmax(dim=-1)
+            next_token = output.logits[:, -1, :vocab_size].argmax(dim=-1)
             del output
             prefix_length = input_ids.size(1)
             first_position = 0 if step == 0 else prefix_length - 1
@@ -157,7 +157,14 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
     architecture = config["architecture"]
     load_options = {"trust_remote_code": architecture != "loopie", "local_files_only": True}
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, **load_options)
-    model_options = {"experts_implementation": "grouped_mm"} if architecture == "loopie" else {}
+    model_options = {}
+    vocab_size = None
+    if architecture == "loopie":
+        vocab_size = read_json(checkpoint / "config.json")["vocab_size"]
+        model_options["experts_implementation"] = "grouped_mm"
+        # Load the embedding and LM head at their stored size. Limit greedy
+        # decoding to the vocabulary declared by the upstream model config.
+        model_options["vocab_size"] = config.get("checkpoint_vocab_size", vocab_size)
     model, loading_info = AutoModelForCausalLM.from_pretrained(
         checkpoint, dtype=getattr(torch, config["dtype"]), output_loading_info=True, use_safetensors=True,
         **load_options, **model_options,
@@ -185,6 +192,9 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
         "torch_cuda": torch.version.cuda,
         "transformers": version("transformers"),
     }
+    if vocab_size is not None:
+        meta["vocab_size"] = vocab_size
+        meta["checkpoint_vocab_size"] = model.config.vocab_size
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(dir=path.parent, prefix=".trace-", delete=False) as temporary:
         temporary_path = Path(temporary.name)
@@ -195,7 +205,8 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
             meta["loop_count"] = 1 + max((loop for _, loop in order if loop is not None), default=-1)
             write_line(stream, meta)
             for index, prompt in enumerate(prompts, start=1):
-                result = collect_request(torch, model, tokenizer, prompt, order, forward, config, max_new_tokens)
+                result = collect_request(torch, model, tokenizer, prompt, order, forward, config, max_new_tokens,
+                                         vocab_size)
                 write_line(stream, result)
                 print(f"[{variant} {index}/{len(prompts)}] {prompt['id']}: {len(result['generated_ids'])} tokens", flush=True)
         os.link(temporary_path, path)

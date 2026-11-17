@@ -5,7 +5,8 @@
       "repo": "zitian-gao/Loopie-6B-A0.6B-preview",
       "revision": "5fd7647161dec494e37abe08b698cb13434b2c34",
       "architecture": "loopie",
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "checkpoint_vocab_size": 152064
     },
     "Looped-MoE": {
       "repo": "ml-ryanlee/seedvar-looped-moe-1e18-d704-seed42",
