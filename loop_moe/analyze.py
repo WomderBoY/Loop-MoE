@@ -1,4 +1,4 @@
-"""Summarize Foil route overlap, router statistics and the decode working set."""
+"""Summarize route overlap, router statistics and the decode working set."""
 
 from __future__ import annotations
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
+from heapq import heapify, heappop, heappush
 from pathlib import Path
 
 from .trace import read_json, read_trace, write_csv
@@ -58,6 +59,9 @@ def future_accesses(visits):
 
 def simulate(visits, policy, capacity, static_keys, alpha, bonus, loop_count):
     cache = {}  # Physical (pool, expert) -> last use index.
+    ranks = {}
+    eviction_queue = []
+    residents = defaultdict(set)
     seen = set()
     frequency = Counter()
     gate_priority = {}
@@ -84,6 +88,12 @@ def simulate(visits, policy, capacity, static_keys, alpha, bonus, loop_count):
             return score, cache[key]
         return (cache[key],)
 
+    def update_priority(key):
+        rank = priority(key)
+        if ranks.get(key) != rank:
+            ranks[key] = rank
+            heappush(eviction_queue, (rank, key))
+
     for visit in visits:
         for expert, _ in visit.demands:
             key = visit.pool, expert
@@ -98,9 +108,18 @@ def simulate(visits, policy, capacity, static_keys, alpha, bonus, loop_count):
                 seen.add(key)
                 if capacity == 0 or (policy == "static_hot" and key not in static_keys):
                     continue
+                residents[visit.pool].add(expert)
             cache[key] = accesses
+            update_priority(key)
             if len(cache) > capacity:
-                del cache[min(cache, key=priority)]
+                # Scores change after accesses and router visits. Discard old
+                # heap entries until the least-priority live entry is found.
+                rank, victim = heappop(eviction_queue)
+                while ranks.get(victim) != rank:
+                    rank, victim = heappop(eviction_queue)
+                del ranks[victim]
+                del cache[victim]
+                residents[victim[0]].remove(victim[1])
 
         if policy == "oled_gate_only":
             score_total = sum(score for _, score in visit.demands)
@@ -113,6 +132,12 @@ def simulate(visits, policy, capacity, static_keys, alpha, bonus, loop_count):
                 scores[expert] = scores.get(expert, 0.0) + alpha * score
         if policy in ("lru_loop", "score_ema_loop") and visit.loop is not None:
             protected[visit.pool] = {expert for expert, _ in visit.demands} if visit.loop + 1 < loop_count else set()
+        if policy in ("oled_gate_only", "score_ema", "score_ema_loop", "lru_loop"):
+            for expert in residents[visit.pool]:
+                update_priority((visit.pool, expert))
+        if len(eviction_queue) > 4 * capacity:
+            eviction_queue = [(rank, key) for key, rank in ranks.items()]
+            heapify(eviction_queue)
     return accesses, misses, reloads
 
 

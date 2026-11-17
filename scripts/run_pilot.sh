@@ -9,7 +9,7 @@ fi
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 out_dir=$1
 shift
-config=${FOIL_CONFIG:-configs/foil_pilot.json}
+config=${MOE_CONFIG:-${FOIL_CONFIG:-configs/foil_pilot.json}}
 python -m loop_moe.collect --config "$config" "$@" --out-dir "$out_dir"
 for trace in "$out_dir"/*/trace.jsonl.gz; do
   result_dir=${trace%/*}

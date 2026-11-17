@@ -1,0 +1,22 @@
+{
+  "models": ["Loopie-6B", "Looped-MoE"],
+  "checkpoints": {
+    "Loopie-6B": {
+      "repo": "zitian-gao/Loopie-6B-A0.6B-preview",
+      "revision": "5fd7647161dec494e37abe08b698cb13434b2c34",
+      "architecture": "loopie",
+      "dtype": "bfloat16"
+    },
+    "Looped-MoE": {
+      "repo": "ml-ryanlee/seedvar-looped-moe-1e18-d704-seed42",
+      "revision": "58e2e609eb6bd7e06ffd34c89cdb6d71b00698fc",
+      "architecture": "looped-moe",
+      "dtype": "float32"
+    }
+  },
+  "prompts": "prompts_pilot.jsonl",
+  "max_new_tokens": 128,
+  "budgets_percent": [5, 10, 20, 40, 80, 100],
+  "score_alpha": 0.2,
+  "loop_bonus": 0.1
+}

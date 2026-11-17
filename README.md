@@ -1,6 +1,6 @@
 # Looped MoE 专家路由与缓存实验
 
-第一轮用 Foil 的公开权重采集生成时的专家路由，再离线比较相同显存预算下的缓存策略。默认使用 **Foil-1 和 Foil-3、BF16、batch=1、greedy decoding、最多 128 个新 token**。项目附带 18 条英文试跑 prompt，文本、数学、代码各 6 条。扩大实验时用 `--prompts` 指定自己的 JSONL，可按 research note 每类准备约 64 条。
+本项目用公开权重采集生成时的专家路由，再离线比较相同缓存预算下的策略。默认使用 **Foil-1 和 Foil-3、BF16、batch=1、greedy decoding、最多 128 个新 token**。另一套配置使用 Loopie-6B 和 Looped-MoE。项目附带 18 条英文试跑 prompt，文本、数学、代码各 6 条。扩大实验时用 `--prompts` 指定自己的 JSONL，可按 research note 每类准备约 64 条。
 
 ## 1. 租用单卡并传代码
 
@@ -52,6 +52,26 @@ bash scripts/run_pilot.sh runs/expanded --prompts /path/to/prompts.jsonl
 
 输入格式示例见 `configs/prompts_pilot.jsonl`。可以重复传 `--model` 选择多个模型。模型已下载时可加 `--local-files-only`。采集完成的文件会保留。若第二个模型中途中断，用同一个输出目录和 `--model Foil-3` 只补跑第二个模型。使用自定义配置时给 `FOIL_CONFIG` 指定配置文件。
 
+### Loopie 和 Looped-MoE
+
+| `--model` | 权重与精度 | 专家层的实际访问顺序 |
+| --- | --- | --- |
+| `Loopie-6B` | [Loopie-6B-A0.6B-preview](https://huggingface.co/zitian-gao/Loopie-6B-A0.6B-preview)，BF16 | 18 个物理层，每层连续执行两次，每层 128 选 8 |
+| `Looped-MoE` | [1e18-d704-seed42](https://huggingface.co/ml-ryanlee/seedvar-looped-moe-1e18-d704-seed42)，FP32 | 8 层整块执行两轮，每层 8 选 2 |
+
+Loopie 使用模型的 chat template，按作者的 [vLLM 实现](https://github.com/zitian-gao/vllm/blob/9a9703d9918115cac2c6abfdb84aca411468c16c/vllm/model_executor/models/qwen3_moe.py) 在 Transformers 内重复调用同一个物理层。Looped-MoE 直接使用作者发布的模型代码和 checkpoint 精度。两者关闭 KV cache，每步重算前缀，采集真实 router 的 top-k。回放使用同一套策略和各模型专家权重的实际字节数。两个 checkpoint 合计约 15 GB，可先在不使用 GPU 的情况下下载。
+
+```bash
+export MOE_CONFIG=configs/loop_models_pilot.json
+bash scripts/download_models.sh
+# 直连 Hugging Face 较慢时可用镜像，仍下载配置所固定的 revision
+HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 bash scripts/download_models.sh
+
+# 从 nvidia-smi 确认空闲卡后，填入该卡的编号或 UUID
+CUDA_VISIBLE_DEVICES=<空闲卡编号> bash scripts/run_pilot.sh runs/loop-smoke --limit 2 --max-new-tokens 4 --local-files-only
+CUDA_VISIBLE_DEVICES=<空闲卡编号> bash scripts/run_pilot.sh runs/loop-pilot --local-files-only
+```
+
 分析与回放可以脱离 GPU 单独运行，只用 Python 标准库。
 
 ```bash
@@ -73,7 +93,7 @@ python -m loop_moe.replay runs/pilot/Foil-1/trace.jsonl.gz --out-dir runs/pilot/
 | `replay/replay_summary.csv`、`replay_requests.csv` | 同预算下各策略的 miss、重复加载、字节命中率和估计 H2D 字节数，分别提供汇总与逐请求数据。 |
 | `replay/replay_config.json` | 记录拟合/评估请求 ID、预算、策略和参数。 |
 
-Foil 发布版每生成一步都会重算整个前缀。首个 forward 保留完整 prefill 路由并预测首个输出 token。后续 forward 的 `routes` 只保留新加入前缀的最后一个输入位置，`prefix_expert_token_counts` 另记本次实际计算的完整前缀负载。每条 `routes` 按位置依次存 `[top-k专家, 原始softmax分数, 专家合并权重, margin, 熵, 上一轮同物理层的block输出cosine, top-p专家与分数]`。绝对位置从 `first_position` 开始，`p=2k`。 [Foil 生成与采集接口](https://huggingface.co/ShourenWSR/how-to-loop-moe/raw/b3d128b44cbefd54e2c8784224a110186c8931f1/modeling_loop_lm.py)
+采集时每生成一步都会重算整个前缀。首个 forward 保留完整 prefill 路由并预测首个输出 token。后续 forward 的 `routes` 只保留新加入前缀的最后一个输入位置，`prefix_expert_token_counts` 另记本次实际计算的完整前缀负载。每条 `routes` 按位置依次存 `[top-k专家, 原始softmax分数, 专家合并权重, margin, 熵, 上一轮同物理层的block输出cosine, top-p专家与分数]`。绝对位置从 `first_position` 开始，`p=2k`。 [Foil 生成与采集接口](https://huggingface.co/ShourenWSR/how-to-loop-moe/raw/b3d128b44cbefd54e2c8784224a110186c8931f1/modeling_loop_lm.py)
 
 回放使用上述 **新位置 decode 路由**，每个请求冷启动，按实际层访问顺序展开，同一层内按专家 ID 串行处理。一个物理专家跨 loop 共用缓存条目。预算为全部专家权重字节数的 5/10/20/40/80/100%，向下取整到可放入的完整专家数。允许在临时计算缓冲中处理 miss 后立即释放，缓存预算只计驻留权重。Belady 在这个等大小、允许绕过缓存的串行模型下给出最少 miss。这里的 H2D 字节数是按 miss 和权重大小推算的流量，端到端速度需要后续单独测量。
 

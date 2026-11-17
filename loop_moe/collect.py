@@ -1,4 +1,4 @@
-"""Collect Foil routes during greedy, cache-free generation on one GPU."""
+"""Collect expert routes during greedy, cache-free generation on one GPU."""
 
 from __future__ import annotations
 
@@ -11,37 +11,19 @@ from importlib.metadata import version
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from .adapters import route_collector
 from .trace import SCHEMA_VERSION, TRACE_SCOPE, read_json, read_jsonl, write_line
 
 
-def expert_layout(model):
-    core = model.model
-    pools = {}
-    for block, layers in (("head", core.head_layers), ("loop", core.stack.layers), ("tail", core.tail_layers)):
-        for index, layer in enumerate(layers):
-            weights = (layer.experts_w1, layer.experts_w2, layer.experts_w3)
-            pools[f"{block}:{index}"] = {
-                "experts": layer.num_experts,
-                "bytes_per_expert": sum(weight[0].numel() * weight.element_size() for weight in weights),
-            }
-    visits = [f"head:{index}" for index in range(core.num_head_layers)]
-    visits += [f"loop:{index}" for _ in range(core.num_stacks) for index in range(len(core.stack.layers))]
-    visits += [f"tail:{index}" for index in range(core.num_tail_layers)]
-    return pools, visits
+FOIL_MODELS = ("Base", "Foil-1", "Foil-2", "Foil-3")
 
 
-def capture_visits(torch, trace_sink, visit_pools, start, stop):
-    if sorted(trace_sink) != list(range(len(visit_pools))):
-        raise RuntimeError("Foil trace does not match the model's unrolled depth")
+def capture_visits(torch, points, order, start, stop):
     selected_ids, candidate_ids, prefix_ids, statistics, visits = [], [], [], [], []
     previous_residuals = {}
-    for depth, pool in enumerate(visit_pools):
-        point = trace_sink[depth]
-        block, _, layer = pool.partition(":")
-        if point.block != block or (block == "loop" and point.layer_idx != int(layer)):
-            raise RuntimeError(f"Foil trace does not match the physical expert pool at depth {depth}")
-        probs = point.router_probs[0, start:stop].float()
-        expert_ids = point.topk_idx[0, start:stop]
+    for depth, ((pool, loop), point) in enumerate(zip(order, points, strict=True)):
+        probs = point.probs[0, start:stop].float()
+        expert_ids = point.ids[0, start:stop]
         top_k = expert_ids.size(-1)
         sorted_probs, candidates = probs.topk(min(2 * top_k, probs.size(-1)), dim=-1)
         margin = sorted_probs[:, top_k - 1] - sorted_probs[:, top_k]
@@ -52,26 +34,26 @@ def capture_visits(torch, trace_sink, visit_pools, start, stop):
             cosine = torch.nn.functional.cosine_similarity(previous_residuals[pool], residual, dim=-1)
         else:
             cosine = torch.zeros_like(margin)
-        if block == "loop":
+        if loop is not None:
             previous_residuals[pool] = residual
         stats = torch.cat(
-            (probs.gather(-1, expert_ids), point.topk_weights[0, start:stop].float(),
+            (probs.gather(-1, expert_ids), point.weights[0, start:stop].float(),
              torch.stack((margin, entropy, cosine), dim=-1), sorted_probs),
             dim=-1,
         )
         selected_ids.append(expert_ids)
         candidate_ids.append(candidates)
-        prefix_ids.append(point.topk_idx[0, :stop].flatten())
+        prefix_ids.append(point.ids[0, :stop].flatten())
         statistics.append(stats)
         visits.append({
             "pool": pool,
             "depth": depth,
-            "loop": point.loop_step if block == "loop" else None,
+            "loop": loop,
             "has_previous_loop": has_previous_loop,
         })
 
     prefix_ids = torch.stack(prefix_ids)
-    expert_count = max(point.num_experts for point in trace_sink.values())
+    expert_count = max(point.probs.size(-1) for point in points)
     prefix_counts = prefix_ids.new_zeros((len(visits), expert_count))
     prefix_counts.scatter_add_(1, prefix_ids, torch.ones_like(prefix_ids))
     for visit, experts, candidates, stats, counts in zip(
@@ -91,10 +73,19 @@ def capture_visits(torch, trace_sink, visit_pools, start, stop):
     return visits
 
 
-def collect_request(torch, model, tokenizer, prompt, visit_pools, max_new_tokens):
-    input_ids = tokenizer(prompt["text"], return_tensors="pt").input_ids
+def collect_request(torch, model, tokenizer, prompt, order, forward, model_config, max_new_tokens):
+    if model_config["architecture"] == "loopie":
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt["text"]}], add_generation_prompt=True,
+            tokenize=True, return_dict=True, return_tensors="pt",
+        ).input_ids
+    else:
+        input_ids = tokenizer(prompt["text"], return_tensors="pt").input_ids
     prompt_ids = input_ids[0].tolist()
-    if not prompt_ids or len(prompt_ids) + max_new_tokens > model.config.context_length:
+    context_length = model.config.max_position_embeddings if model_config["architecture"] == "loopie" else (
+        model.config.context_length
+    )
+    if not prompt_ids or len(prompt_ids) + max_new_tokens > context_length:
         raise ValueError(f"Prompt {prompt['id']} is empty or prompt + generation exceeds the model context")
     input_ids = input_ids.to("cuda:0")
     eos = getattr(model.generation_config, "eos_token_id", None)
@@ -105,8 +96,7 @@ def collect_request(torch, model, tokenizer, prompt, visit_pools, max_new_tokens
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
-            sink = {}
-            output = model(input_ids=input_ids, trace_sink=sink)
+            output, points = forward(input_ids)
             next_token = output.logits[:, -1, :].argmax(dim=-1)
             del output
             prefix_length = input_ids.size(1)
@@ -116,9 +106,9 @@ def collect_request(torch, model, tokenizer, prompt, visit_pools, max_new_tokens
                 "phase": "prefill" if step == 0 else "decode",
                 "prefix_length": prefix_length,
                 "first_position": first_position,
-                "visits": capture_visits(torch, sink, visit_pools, first_position, prefix_length),
+                "visits": capture_visits(torch, points, order, first_position, prefix_length),
             })
-            sink.clear()
+            del points
             generated_ids.append(next_token.item())
             if generated_ids[-1] in stop_ids or step + 1 == max_new_tokens:
                 break
@@ -134,9 +124,22 @@ def collect_request(torch, model, tokenizer, prompt, visit_pools, max_new_tokens
     }
 
 
+def download_model(config, local_files_only):
+    from huggingface_hub import snapshot_download
+
+    subfolder = config.get("subfolder")
+    patterns = ["*.json", "*.py", "*.safetensors", "*.jinja", "merges.txt", "*.model"]
+    if subfolder:
+        patterns = [f"{subfolder}/{pattern}" for pattern in patterns]
+    snapshot = Path(snapshot_download(
+        repo_id=config["repo"], revision=config["revision"], allow_patterns=patterns,
+        local_files_only=local_files_only,
+    ))
+    return snapshot / subfolder if subfolder else snapshot
+
+
 def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
     import torch
-    from huggingface_hub import snapshot_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     path = args.out_dir / variant / "trace.jsonl.gz"
@@ -145,21 +148,23 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU unavailable. Check nvidia-smi and the installed PyTorch CUDA build.")
     capability = torch.cuda.get_device_capability(0)
-    if not torch.cuda.is_bf16_supported(including_emulation=False):
-        raise RuntimeError(f"Foil requires native CUDA BF16 support; detected compute capability {capability}")
+    if config["dtype"] == "bfloat16" and not torch.cuda.is_bf16_supported(including_emulation=False):
+        raise RuntimeError(f"BF16 requires native CUDA support; detected compute capability {capability}")
     if capability[0] >= 12 and tuple(map(int, torch.version.cuda.split("."))) < (12, 8):
         raise RuntimeError("Blackwell requires a newer PyTorch CUDA build. Use scripts/setup_gpu.sh cu130.")
 
-    snapshot = snapshot_download(
-        repo_id=config["repo"], revision=config["revision"], allow_patterns=f"{variant}/*",
-        local_files_only=args.local_files_only,
+    checkpoint = download_model(config, args.local_files_only)
+    architecture = config["architecture"]
+    load_options = {"trust_remote_code": architecture != "loopie", "local_files_only": True}
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, **load_options)
+    model_options = {"experts_implementation": "grouped_mm"} if architecture == "loopie" else {}
+    model, loading_info = AutoModelForCausalLM.from_pretrained(
+        checkpoint, dtype=getattr(torch, config["dtype"]), output_loading_info=True, use_safetensors=True,
+        **load_options, **model_options,
     )
-    checkpoint = Path(snapshot) / variant
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint, trust_remote_code=True, local_files_only=True, dtype=torch.bfloat16,
-    ).to("cuda:0").eval()
-    pools, visit_pools = expert_layout(model)
+    if any(loading_info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
+        raise RuntimeError(f"Checkpoint did not load cleanly: {loading_info}")
+    model = model.to("cuda:0").eval()
     meta = {
         "schema_version": SCHEMA_VERSION,
         "trace_scope": TRACE_SCOPE,
@@ -169,9 +174,10 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
         "request_count": len(prompts),
         "prompts_sha256": hashlib.sha256(prompts_path.read_bytes()).hexdigest(),
         "max_new_tokens": max_new_tokens,
-        "loop_count": model.model.num_stacks,
-        "pools": pools,
-        "dtype": "bfloat16",
+        "architecture": architecture,
+        "subfolder": config.get("subfolder"),
+        "prompt_format": "chat_template" if architecture == "loopie" else "raw_text",
+        "dtype": config["dtype"],
         "gpu": torch.cuda.get_device_name(0),
         "compute_capability": capability,
         "python": platform.python_version(),
@@ -183,10 +189,13 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
     with NamedTemporaryFile(dir=path.parent, prefix=".trace-", delete=False) as temporary:
         temporary_path = Path(temporary.name)
     try:
-        with gzip.open(temporary_path, "wt", encoding="utf-8") as stream:
+        with route_collector(torch, model, architecture) as (pools, order, forward), \
+                gzip.open(temporary_path, "wt", encoding="utf-8") as stream:
+            meta["pools"] = pools
+            meta["loop_count"] = 1 + max((loop for _, loop in order if loop is not None), default=-1)
             write_line(stream, meta)
             for index, prompt in enumerate(prompts, start=1):
-                result = collect_request(torch, model, tokenizer, prompt, visit_pools, max_new_tokens)
+                result = collect_request(torch, model, tokenizer, prompt, order, forward, config, max_new_tokens)
                 write_line(stream, result)
                 print(f"[{variant} {index}/{len(prompts)}] {prompt['id']}: {len(result['generated_ids'])} tokens", flush=True)
         os.link(temporary_path, path)
@@ -198,14 +207,29 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/foil_pilot.json"))
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--model", action="append", choices=("Base", "Foil-1", "Foil-2", "Foil-3"))
+    parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--model", action="append")
     parser.add_argument("--prompts", type=Path)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--download-only", action="store_true", help="Download checkpoints without using a GPU")
     args = parser.parse_args()
     config = read_json(args.config)
+    models = config.get("checkpoints")
+    if models is None:
+        models = {name: {"repo": config["repo"], "revision": config["revision"], "subfolder": name,
+                         "architecture": "foil", "dtype": "bfloat16"} for name in FOIL_MODELS}
+    selected = args.model or config["models"]
+    for name in selected:
+        if name not in models:
+            parser.error(f"Unknown model {name!r}. Available: {', '.join(models)}")
+    if args.download_only:
+        for name in selected:
+            print(download_model(models[name], args.local_files_only), flush=True)
+        return
+    if args.out_dir is None:
+        parser.error("--out-dir is required for route collection")
     prompts_path = args.prompts or args.config.parent / config["prompts"]
     prompts = list(read_jsonl(prompts_path))
     if args.limit is not None:
@@ -220,8 +244,8 @@ def main():
         parser.error("Each prompt needs nonempty id, category and text strings")
     if len({prompt["id"] for prompt in prompts}) != len(prompts):
         parser.error("Prompt IDs must be unique")
-    for variant in args.model or config["models"]:
-        collect_model(args, config, variant, prompts, prompts_path, max_new_tokens)
+    for variant in selected:
+        collect_model(args, models[variant], variant, prompts, prompts_path, max_new_tokens)
 
 
 if __name__ == "__main__":
