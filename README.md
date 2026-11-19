@@ -2,6 +2,44 @@
 
 本项目用公开权重采集生成时的专家路由，再离线比较相同缓存预算下的策略。默认使用 **Foil-1 和 Foil-3、BF16、batch=1、greedy decoding、最多 128 个新 token**。另一套配置使用 Loopie-6B 和 Looped-MoE。项目附带 18 条英文试跑 prompt，文本、数学、代码各 6 条。扩大实验时用 `--prompts` 指定自己的 JSONL，可按 research note 每类准备约 64 条。
 
+## 扩大采样（2026-11-19）
+
+`configs/expanded.json` 使用 Foil-1、Foil-3、Loopie-6B、Looped-MoE 四个原 checkpoint，**每模型 192 条 prompt、最多 512 个新 token**。三类各 64 条，均为新请求，来自 [Dolly](https://huggingface.co/datasets/databricks/databricks-dolly-15k)、[GSM8K test](https://github.com/openai/grade-school-math)、[sanitized MBPP test](https://github.com/google-research/google-research/tree/master/mbpp)，只取题目，不向模型提供答案或测试。固定 revision、源文件 SHA256、选取规则及许可记录在 `configs/prompts_expanded.sources.json`；四个模型共享同一输入文件。Dolly 选取的内容及其添加回答后缀的版本按 CC-BY-SA-3.0 提供，归属 Databricks 及原贡献者；GSM8K 为 MIT，MBPP 为 CC-BY-4.0，归属各数据集原作者。
+
+最多生成量由每模型 2,304 增至 98,304 token（约 42.7 倍）。保留正常 EOS 停止，实际数量以轨迹和 `analysis/requests.csv` 为准。模型精度、greedy、batch=1、循环结构、回放预算及策略参数沿用试跑设置；原 18 条 prompt 和历史结果保留。这批输入用于路由统计，不用于报告标准 benchmark 的准确率。
+
+在服务器已有 `~/loop-moe-env` 环境中运行：
+
+```bash
+cd ~/Loop-MoE
+# 只做 tokenizer/context 检查，不加载模型、不使用 GPU
+PYTHON=~/loop-moe-env/bin/python bash scripts/run_expanded.sh runs/expanded-20261119-v1 --preflight-only
+
+# 先检查显存和计算进程；将 5、7 换成实际空闲卡号
+nvidia-smi
+mkdir -p runs/expanded-20261119-v1/logs
+nohup env PYTHON="$HOME/loop-moe-env/bin/python" \
+  bash scripts/run_expanded.sh runs/expanded-20261119-v1 --gpus 5 7 \
+  >runs/expanded-20261119-v1/logs/driver.log 2>&1 < /dev/null &
+
+# 查看总状态和逐批日志
+cat runs/expanded-20261119-v1/status.json
+tail -n 20 runs/expanded-20261119-v1/logs/driver.log
+```
+
+脚本最多使用两张明确指定的卡，启动时、每批前及采集中检查计算进程；发现其他进程占卡会停止自己的采集，不终止他人进程，也不等待空闲后自动重试。每批 24 条（各类 8 条），两个工作进程共享 32 批任务；已完成批次可复用，同样的命令可恢复，未完成批次重跑。恢复要求配置、输入和采集/分析代码指纹一致；改动后使用新输出目录。
+
+采集完成后释放 GPU，自动合并各模型的 8 批轨迹，运行原分析、基础回放与驻留实验。合并后再划分拟合/评估集，不按小批次各自划分；沿用每类约 1/3 拟合、2/3 评估，即每模型 **63 条拟合、129 条评估**，不做新一轮参数搜索。完整结果位于 `runs/expanded-20261119-v1/<模型>/` 下的 `trace.jsonl.gz`、`analysis/`、`replay/`、`residency/`。`manifest.json` 保存输入/代码指纹，`preflight.json` 保存各模型的上下文检查。
+
+如需重新构建同一批输入，先指定一个未存在的输出文件；这个步骤不调用模型：
+
+```bash
+python scripts/prepare_expanded_prompts.py --cache /tmp/loop-moe-prompt-sources \
+  --out /tmp/prompts_expanded.jsonl
+```
+
+采集仍按每步重算完整前缀的方式进行，512 token 会明显增加计算量。增加样本量能改善路由与回放统计，不能据此得出真实 KV-cached decode 或端到端加速结论。
+
 ## 1. 租用单卡并传代码
 
 以下为两台校内服务器的只读查询结果，适合对照租用实例的实际 GPU 型号和驱动。
@@ -25,12 +63,27 @@ ssh "$GPU_HOST"
 
 ## 2. 在租用实例配置环境
 
+如果平台提供以下两种基础镜像，优先选择 **PyTorch 2.12.1 / Python 3.12 / Ubuntu 22.04 / CUDA 13.0**。无需自制镜像；进入后新建下面的 Python 3.11 环境，按脚本安装本项目已验证的版本。基础镜像预装的 Python/PyTorch 与实验环境可以不同，不直接复用其 2.12.1 环境。
+
+另一种 **PyTorch 2.8.0 / Python 3.12 / Ubuntu 22.04 / CUDA 12.8** 也可作为系统底座，但不是当前默认选择；同样需要新建环境并安装项目依赖。能否使用 `cu130` 取决于实例宿主机 NVIDIA 驱动，而不是仅看镜像名称；`nvidia-smi` 中的 CUDA Version 表示驱动支持的 CUDA 上限，不是当前 Python 的 PyTorch CUDA 构建。当前 A800 上已实际验证的是：
+
+| 组件 | 已验证版本 |
+| --- | --- |
+| Python | 3.11.18（脚本要求 3.11） |
+| PyTorch | 2.13.0+cu130 |
+| Transformers | 5.15.0 |
+| einops | 0.8.2 |
+| A800 驱动 | 580.126.20 |
+
+租用 CUDA 13.0 实例时优先选驱动 `580.126.20` 或更新以贴近已验证环境；CUDA 13.x 要求 R580 或更新的驱动系列。PyTorch 官方提供 2.13.0 的 `cu130` 安装包，使用下面的脚本即可，无需手动编译 PyTorch 或单独安装系统 CUDA Toolkit。[PyTorch 官方安装版本](https://pytorch.org/get-started/previous-versions/#v2130) · [NVIDIA CUDA 兼容说明](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+
 ```bash
 cd ~/loop-moe
 nvidia-smi
 conda create -n loop-moe python=3.11 -y
 conda activate loop-moe
 bash scripts/setup_gpu.sh cu130
+python -m unittest discover -s tests -v
 ```
 
 脚本安装 `torch==2.13.0` 对应的 CUDA 构建、`transformers==5.15.0` 和 `einops==0.8.2`。模型代码与权重固定在 `configs/foil_pilot.json` 所列的 Hugging Face revision，首次运行自动下载所选模型的文件。两个模型的权重各约 1.1 GB，另需为 PyTorch 安装和缓存留空间。若系统盘空间有限，先将 `HF_HOME` 指到实例的可写数据盘。模型由发布者提供的自定义 Python 实现加载。 [Foil 模型卡](https://huggingface.co/ShourenWSR/how-to-loop-moe)
@@ -109,3 +162,83 @@ bash -n scripts/run_pilot.sh
 ```
 
 这些检查只读合成轨迹和脚本。第一次真实生成由租用实例上的 `runs/smoke` 验证。
+
+## 5. 下一次同池访问的驻留实验
+
+[方法设计](docs/loop-aware-expert-residency.md)对应的新入口是 `loop_moe.residency`。它只读已采集轨迹，**不加载模型、不需要 GPU**，使用 Python 3.11 和标准库。原来的 `loop_moe.replay` 保留用于复查历史结果。
+
+### 环境与运行命令
+
+```bash
+conda env create -f environment-replay.yml
+conda activate loop-moe-replay
+python -m unittest discover -s tests -v
+
+# 服务器已有 GPU 环境也可以直接复用，不需要安装额外依赖
+cd ~/Loop-MoE
+PYTHON=~/loop-moe-env/bin/python bash scripts/run_residency.sh runs/residency-pilot \
+  runs/a800-20261117/pilot/Looped-MoE/trace.jsonl.gz \
+  runs/a800-20261117/pilot/Loopie-6B/trace.jsonl.gz
+
+# Foil 结构边界检查；请换成自己机器上的轨迹路径
+PYTHON=~/loop-moe-env/bin/python bash scripts/run_residency.sh runs/residency-foil \
+  runs/pilot_2026-11-13/pilot/Foil-1/trace.jsonl.gz \
+  runs/pilot_2026-11-13/pilot/Foil-3/trace.jsonl.gz
+
+# 单独运行一个模型
+python -m loop_moe.residency /path/to/trace.jsonl.gz \
+  --config configs/residency.json --out-dir runs/residency-single/Looped-MoE
+```
+
+默认六档预算为 5/10/20/40/80/100%。`run_residency.sh` 会拒绝覆盖已有完成结果；改变配置时使用新的输出目录。Mac 只运行合成轨迹测试；正式回放建议使用服务器 CPU。需要新轨迹时，继续使用上面的下载、GPU 环境和采集脚本，在运行前重新确认空闲显卡。
+
+### 预测器和执行规则
+
+- 每个请求冷启动。路由历史按物理池和阶段保存，不要求对应专家一直驻留。每次 source 访问只预测下一次同池访问；距离来自固定执行表，包含 Foil head/tail，不读取未来实际 miss 或路由。新采集会直接记录 `execution_order`；旧轨迹只从首步提取池/阶段顺序，并检查所有请求每步结构一致。
+- A 是本 token 上一轮，B 是目标阶段最近一次已完成访问。跨 token 首轮时 A 缺失，上一 token 末轮作为单独边界特征。当前 gate 已产生后更新当前池估值，所有方法都在同样的专家 ID 升序下逐个服务；未驻留专家只在实际被路由选中时加载。
+- 每次拟合机会包含池内**全部**专家，榜外专家也计入分母。gate 排名分为第 1、其余 top-k、k+1 至 2k、榜外；EMA 分为零、低于 1/N、其余三档。计数概率依次向共享特征、同池特征收缩，稀疏处回退到拟合热度和已观测 gate EMA。默认收缩强度 32，不做自动调参。
+- `gate_ema`、`history_a`、`history_b`、`phase_ab` 比较历史增量；`pooled_ab` 合并阶段；`boundary_ab` 只区分跨 token 与内部转移。`generic_lag` 不读阶段标签，记录同池最近 m 次访问的完整布尔模式，m 为一 token 的同池访问次数，和双历史覆盖相同跨度；稀疏模式向“最近一次/更早是否出现”退回。每层统计表统一最多 4096 个 cell，按拟合机会数裁剪，实际 cell 数写入配置，**各级 cell 上限相同，实际使用量可能不同；这不等同于严格匹配已拟合参数数目**。
+- 四格主对照为 `phase_ab` / `generic_lag`，分别加或不加 `_distance`。折扣为 `p/(1+d)`，每次访问重新计算尚余的 d；优化 H2D 字节时 H=b，字节因子抵消。没有为当前层或上一轮专家设置硬保留名额。
+- `phase_ab_shuffled` 只打乱拟合集中同池同目标阶段的 source→target 配对，整体置换目标 top-k 集合，保留阶段专家边缘频率；评估顺序保持真实顺序，随机种子固定为 20261118。
+
+### 显存口径与基线
+
+默认 `memory_mode=peak`，预算同时容纳驻留专家和正在传输/计算的一个专家。miss 时先腾出槽位再加载，至少要容纳一个专家。`peak_weight_bytes` 不含固定的 attention、激活等非专家开销，也不代表实测 GPU 峰值。等大小专家下，Belady 在完全相同的服务顺序、准入和缓冲规则下运行；穷举测试验证其最优性。
+
+将配置复制到新文件并设 `memory_mode=resident` 可使用旧的“允许额外一个专家临时缓冲、服务后立即绕过缓存”模型，适合与历史分析对照；输出显式记录额外缓冲后的峰值。当前 gate 对所有策略都在服务前可见；旧 `replay` 在服务后才更新分数，因此新实现的分数基线与旧数字不要求完全相同。**跨显存口径不要直接比较命中率。**
+
+除了 LRU/LFU/静态热门/固定 loop 奖励/gate-only/Score EMA，增加 `oled_adaptive` 驻留适配版：当前激活专家归一化 gate 分数、未激活专家置零；用平滑激活比率与缓存利用率的乘积分配层配额，每 5 个完整 decode 位置更新一次，按整数比例分配并限制池大小。空池利用率取中性值 1，便于零配额恢复；EMA 沿用 0.2。这些是单位置回放的明确适配选择，**没有复现 OLED 的完整执行系统或 CPU 补偿**。参考 [OLED-MoE §4.3](https://arxiv.org/html/2609.33385v1#S4.SS3)。
+
+### 输出与解释
+
+| 文件 | 内容 |
+| --- | --- |
+| `residency_summary.csv` | 各预算/策略的字节命中率、每 decode 位置 H2D、相对最强在线基线的流量变化。最强基线包含传统策略、gate/EMA 预测、合并/边界阶段以及两种通用历史对照，是评估集整体上的回顾性参照，不用于选参；Belady 不参加在线排名。 |
+| `residency_requests.csv` | 逐请求流量、命中、重载、专家权重峰值和 OLED 配额更新数。 |
+| `residency_positions.csv` | 每个 decode 位置的实际访问数、miss 和推算 H2D。 |
+| `residency_phases.csv` | 按物理池、目标阶段、跨 token 首轮/内部转移分开统计，包含冷启动首轮。 |
+| `paired_requests.csv` / `paired_summary.csv` | 每个新策略对每个在线基线的额外命中字节、损失命中字节和净节省；逐请求配对差值、样本标准差及改善/退化请求数。增减是同一次访问上的命中差，满足 gained−lost=净节省，不表示唯一的因果淘汰链。 |
+| `prediction_requests.csv` | 各 source→target 转移的 top-k 召回。完整物理池候选取目标 k 个；驻留候选统一取 source 时刻 **Score EMA 的同一驻留集合**，固定保留 2 个，另报候选中可达目标数和条件召回。最后一次没有实际后继的 source 不进入指标。 |
+| `residency_config.json` | 拟合/验证/评估 ID、执行表、固定参数、显存口径、轨迹与源文件 SHA256、Python 版本、拟合表实际大小及运行时间。 |
+| `predictors.json` | 拟合得到的选中次数/机会次数表和专家热度，方便检查分母与稀疏程度。 |
+
+默认沿用旧 pilot 的按类别哈希划分，18 条请求中 6 条拟合、12 条评估；这些评估请求此前已用于确定方向，所以结果只能作为开发对照。最终实验应另采此前未查看的新请求，用显式 ID 划分：
+
+```json
+{
+  "fit_request_ids": ["fit-01", "fit-02"],
+  "validation_request_ids": ["val-01"],
+  "evaluation_request_ids": ["test-01", "test-02"]
+}
+```
+
+三个集合必须互斥并完整覆盖输入轨迹。验证集留出供外部选参，本程序不自动调参，也不把验证请求混入拟合或测试。运行时传 `--split /path/to/split.json`，或给批处理脚本设 `RESIDENCY_SPLIT`；参数选择完成后固定配置再运行测试。回放不测量端到端 TPOT、真实传输重叠或 GPU 调度开销。
+
+完成后可以验证结果收支并生成中文表格报告（只读结果，不重新拟合）：
+
+```bash
+python -m loop_moe.residency_report runs/residency-pilot/Looped-MoE \
+  runs/residency-pilot/Loopie-6B --output runs/residency-pilot/report.md
+```
+
+已完成的四模型开发对照见 [2026-11-18 回放报告](docs/residency-pilot-2026-11-18.md)，本机与 `pku_A800:~/Loop-MoE/runs/residency-20261118-v1/` 均保存原始结果。

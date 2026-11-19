@@ -1,0 +1,35 @@
+{
+  "seed": 20261119,
+  "request_count": 192,
+  "category_counts": {
+    "text": 64,
+    "math": 64,
+    "code": 64
+  },
+  "sha256": "bab6fd9ec1938dd61323b08c4c0c3540c77e59849ae4cc04913dd07d05822b83",
+  "sources": {
+    "dolly": {
+      "revision": "bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a",
+      "url": "https://huggingface.co/datasets/databricks/databricks-dolly-15k/resolve/bdd27f4d94b9c1f951818a7da7fd7aeea5dbff1a/databricks-dolly-15k.jsonl",
+      "homepage": "https://huggingface.co/datasets/databricks/databricks-dolly-15k",
+      "license": "CC-BY-SA-3.0",
+      "sha256": "2df9083338b4abd6bceb5635764dab5d833b393b55759dffb0959b6fcbf794ec"
+    },
+    "gsm8k": {
+      "revision": "3101c7d5072418e28b9008a6636bde82a006892c",
+      "url": "https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl",
+      "homepage": "https://github.com/openai/grade-school-math",
+      "license": "MIT",
+      "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
+    },
+    "mbpp": {
+      "revision": "e2c3f9b85ff9804147541060bf35d68bf14f2258",
+      "url": "https://raw.githubusercontent.com/google-research/google-research/e2c3f9b85ff9804147541060bf35d68bf14f2258/mbpp/sanitized-mbpp.json",
+      "homepage": "https://github.com/google-research/google-research/tree/master/mbpp",
+      "license": "CC-BY-4.0",
+      "sha256": "ca95deaa9a01ef0a6f439f88bcf0dd3db3563d22f22aad6cae04ebb9a8d8c8e9"
+    }
+  },
+  "selection": "SHA256(seed:namespace:source_id) order; unique 20..1400 character source texts; Dolly no-context 16 each general_qa/open_qa/creative_writing/brainstorming; GSM8K test 64; sanitized MBPP test task IDs 11..510, 64. Answers/tests excluded.",
+  "purpose": "Expert-routing workload only; not a quality benchmark. Dolly subset with answer suffix is distributed under CC-BY-SA-3.0; preserve source attribution and share-alike terms."
+}

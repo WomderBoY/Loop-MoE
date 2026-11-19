@@ -202,6 +202,7 @@ def collect_model(args, config, variant, prompts, prompts_path, max_new_tokens):
         with route_collector(torch, model, architecture) as (pools, order, forward), \
                 gzip.open(temporary_path, "wt", encoding="utf-8") as stream:
             meta["pools"] = pools
+            meta["execution_order"] = order
             meta["loop_count"] = 1 + max((loop for _, loop in order if loop is not None), default=-1)
             write_line(stream, meta)
             for index, prompt in enumerate(prompts, start=1):

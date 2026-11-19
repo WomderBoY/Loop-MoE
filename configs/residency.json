@@ -1,0 +1,11 @@
+{
+  "budgets_percent": [5, 10, 20, 40, 80, 100],
+  "score_alpha": 0.2,
+  "loop_bonus": 0.1,
+  "shrinkage": 32,
+  "max_table_cells": 4096,
+  "shuffle_seed": 20261118,
+  "memory_mode": "peak",
+  "retention_slots": 2,
+  "oled_update_tokens": 5
+}
