@@ -13,3 +13,4 @@ nltk>=3.8
 rouge_score>=0.1.2
 tensorboard>=2.16.0
 wandb>=0.17.0
+flash-linear-attention

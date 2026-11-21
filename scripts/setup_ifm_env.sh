@@ -25,10 +25,17 @@ if ! "$PYTHON_BIN" -c 'import einops, tiktoken, sentencepiece, blobfile, typegua
   echo "[setup] Installing missing lightweight Python deps..."
   "$PYTHON_BIN" -m pip install -q --no-cache-dir \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    -r "$ROOT_DIR/requirements-ifm.txt"
-else
-  echo "[setup] All Python deps already present."
+    einops tiktoken==0.8.0 sentencepiece blobfile "typeguard>=4.5.0" fire pyarrow \
+    submitit nvidia-ml-py nltk rouge_score tensorboard wandb
 fi
+
+if ! "$PYTHON_BIN" -c 'import fla' 2>/dev/null; then
+  echo "[setup] Installing flash-linear-attention (--no-deps to preserve torch+cu130)..."
+  "$PYTHON_BIN" -m pip install -q --no-cache-dir --no-deps \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    flash-linear-attention
+fi
+echo "[setup] All Python deps ready."
 
 # Clone and pin official ifm-ai/xllm-loop
 if [[ ! -d "$XLLM_LOOP_DIR/.git" ]]; then
