@@ -1,35 +1,83 @@
 # Looped MoE 专家路由与缓存实验
 
-本项目用公开权重采集生成时的专家路由，再离线比较相同缓存预算下的策略。默认使用 **Foil-1 和 Foil-3、BF16、batch=1、greedy decoding、最多 128 个新 token**。另一套配置使用 Loopie-6B 和 Looped-MoE。项目附带 18 条英文试跑 prompt，文本、数学、代码各 6 条。扩大实验时用 `--prompts` 指定自己的 JSONL，可按 research note 每类准备约 64 条。
+本项目研究深度循环 MoE 在 GPU 专家缓存受限时，能否利用循环阶段和已知执行顺序减少专家权重搬运，目标是 ICML 2027。流程包括真实路由采集、离线回放和强在线基线对照。
 
-## 扩大采样（2026-11-19）
+截至 2026-11-21，四模型扩样已完成，共 **768 条请求、380,492 个生成 token**。Loopie-6B 在 **5% 专家缓存预算**下估计 H2D 字节减少 **1.140%**，129 条评估请求均受益。结果来自离线回放，工作负载的质量与适用范围见扩样报告。
+
+| 文档 | 内容 |
+| --- | --- |
+| [研究笔记](docs/research-note.md) | 当前判断、相关工作和下一轮实验 |
+| [扩样结果与生成质量](docs/expanded-results-2026-11-20.md) | 新旧对比、全部预算结果、消融和检查点质量 |
+| [驻留方法设计](docs/loop-aware-expert-residency.md) · [开发集回放](docs/residency-pilot-2026-11-18.md) | 方法定义和旧试跑证据 |
+| [扩样运行记录](docs/expanded-run-2026-11-19.md) | 固定配置、采集环境、服务器归档与 CPU 续跑 |
+
+本地实验目录 `runs/`、演示资料 `slides/` 及演示校验输出由 Git 忽略。复核既有实验时，使用运行记录中的归档快照、配置和结果。
+
+## 复现四模型扩样
 
 `configs/expanded.json` 使用 Foil-1、Foil-3、Loopie-6B、Looped-MoE 四个原 checkpoint，**每模型 192 条 prompt、最多 512 个新 token**。三类各 64 条，均为新请求，来自 [Dolly](https://huggingface.co/datasets/databricks/databricks-dolly-15k)、[GSM8K test](https://github.com/openai/grade-school-math)、[sanitized MBPP test](https://github.com/google-research/google-research/tree/master/mbpp)，只取题目，不向模型提供答案或测试。固定 revision、源文件 SHA256、选取规则及许可记录在 `configs/prompts_expanded.sources.json`；四个模型共享同一输入文件。Dolly 选取的内容及其添加回答后缀的版本按 CC-BY-SA-3.0 提供，归属 Databricks 及原贡献者；GSM8K 为 MIT，MBPP 为 CC-BY-4.0，归属各数据集原作者。
 
 最多生成量由每模型 2,304 增至 98,304 token（约 42.7 倍）。保留正常 EOS 停止，实际数量以轨迹和 `analysis/requests.csv` 为准。模型精度、greedy、batch=1、循环结构、回放预算及策略参数沿用试跑设置；原 18 条 prompt 和历史结果保留。这批输入用于路由统计，不用于报告标准 benchmark 的准确率。
 
-在服务器已有 `~/loop-moe-env` 环境中运行：
+按[服务器与环境](#服务器与环境)配置并激活 Python 3.11 后，可在服务器上复现到新输出目录。以下命令在服务器的仓库根目录执行。已有四个固定 revision 的缓存时，可跳过下载步骤。
 
 ```bash
-cd ~/Loop-MoE
+OUT_DIR=runs/expanded-reproduction
+PYTHON=$(command -v python)
+MOE_CONFIG=configs/expanded.json bash scripts/download_models.sh
 # 只做 tokenizer/context 检查，不加载模型、不使用 GPU
-PYTHON=~/loop-moe-env/bin/python bash scripts/run_expanded.sh runs/expanded-20261119-v1 --preflight-only
+PYTHON="$PYTHON" bash scripts/run_expanded.sh "$OUT_DIR" --preflight-only
 
 # 先检查显存和计算进程；将 5、7 换成实际空闲卡号
 nvidia-smi
-mkdir -p runs/expanded-20261119-v1/logs
-nohup env PYTHON="$HOME/loop-moe-env/bin/python" \
-  bash scripts/run_expanded.sh runs/expanded-20261119-v1 --gpus 5 7 \
-  >runs/expanded-20261119-v1/logs/driver.log 2>&1 < /dev/null &
+mkdir -p "$OUT_DIR/logs"
+nohup env PYTHON="$PYTHON" \
+  bash scripts/run_expanded.sh "$OUT_DIR" --gpus 5 7 \
+  >"$OUT_DIR/logs/driver.log" 2>&1 < /dev/null &
 
 # 查看总状态和逐批日志
-cat runs/expanded-20261119-v1/status.json
-tail -n 20 runs/expanded-20261119-v1/logs/driver.log
+cat "$OUT_DIR/status.json"
+tail -n 20 "$OUT_DIR/logs/driver.log"
 ```
 
 脚本最多使用两张明确指定的卡，启动时、每批前及采集中检查计算进程；发现其他进程占卡会停止自己的采集，不终止他人进程，也不等待空闲后自动重试。每批 24 条（各类 8 条），两个工作进程共享 32 批任务；已完成批次可复用，同样的命令可恢复，未完成批次重跑。恢复要求配置、输入和采集/分析代码指纹一致；改动后使用新输出目录。
 
-采集完成后释放 GPU，自动合并各模型的 8 批轨迹，运行原分析、基础回放与驻留实验。合并后再划分拟合/评估集，不按小批次各自划分；沿用每类约 1/3 拟合、2/3 评估，即每模型 **63 条拟合、129 条评估**，不做新一轮参数搜索。完整结果位于 `runs/expanded-20261119-v1/<模型>/` 下的 `trace.jsonl.gz`、`analysis/`、`replay/`、`residency/`。`manifest.json` 保存输入/代码指纹，`preflight.json` 保存各模型的上下文检查。
+### AutoDL：无卡准备，单张 A800 80GB 四模型并发
+
+本次租用实例的代码目录为 `/root/autodl-tmp/Loop-MoE`，环境为 `/root/miniconda3/envs/loop-moe`，权重缓存为 `/root/autodl-tmp/huggingface`。`scripts/autodl_env.sh` 设置这些路径与 Hugging Face 镜像。无卡模式可以完成依赖安装、权重下载、文件校验、合成测试和 tokenizer 上下文检查，不运行模型 forward。
+
+```bash
+cd /root/autodl-tmp/Loop-MoE
+source scripts/autodl_env.sh
+OUT_DIR=runs/autodl-a800-reproduction
+# 首次准备时创建环境并安装依赖
+conda create --prefix "$MOE_ENV_PREFIX" python=3.11 -y
+bash scripts/setup_gpu.sh cu130
+# 无卡模式的准备与检查
+MOE_CONFIG=configs/expanded.json bash scripts/download_models.sh
+python scripts/verify_model_cache.py --output runs/setup/verified-models.json
+python -m unittest discover -s tests -v
+HF_HUB_OFFLINE=1 python -m loop_moe.expanded \
+  --out-dir "$OUT_DIR" --preflight-only
+```
+
+切换为**单 GPU 模式、A800 80GB** 后启动：
+
+```bash
+cd /root/autodl-tmp/Loop-MoE
+OUT_DIR=runs/autodl-a800-reproduction
+mkdir -p "$OUT_DIR/logs"
+nohup bash scripts/run_autodl_single_gpu.sh "$OUT_DIR" \
+  >"$OUT_DIR/logs/driver.log" 2>&1 < /dev/null &
+cat "$OUT_DIR/status.json"
+tail -n 20 "$OUT_DIR/logs/driver.log"
+```
+
+该入口使用 `--parallel-models --exclusive-gpu`，每个模型独立运行一个采集任务队列，按顺序完成自己的 8 批请求。默认选择唯一可见 GPU 的 UUID，可用 `GPU_ID` 指定卡号或 UUID。启动会核对 A800 80GB 型号、至少 60 GiB 空闲显存和 GPU 占用情况。`--exclusive-gpu` 仅用于租用平台独占分配的整卡，运行期间依赖平台隔离。共享校内服务器使用默认的持续占卡检查。四进程共享 GPU 的运行用于路由采样。
+
+通用入口也支持 `bash scripts/run_expanded.sh OUT_DIR --gpus 0 --parallel-models`；省略 `--parallel-models` 则沿用每张卡一个进程的任务队列方式。
+
+采集完成后释放 GPU，自动合并各模型的 8 批轨迹，然后运行路由统计、基础回放与驻留回放。合并后按请求划分，每模型 **63 条拟合、129 条评估**。输出目录包含各模型的 `trace.jsonl.gz`、`analysis/`、`replay/`、`residency/`，以及记录输入和代码指纹的 `manifest.json` 与上下文检查结果 `preflight.json`。已完成的 11 月扩样归档位置和 CPU 续跑命令见[运行记录](docs/expanded-run-2026-11-19.md#归档与-cpu-后处理)。
 
 如需重新构建同一批输入，先指定一个未存在的输出文件；这个步骤不调用模型：
 
@@ -40,7 +88,9 @@ python scripts/prepare_expanded_prompts.py --cache /tmp/loop-moe-prompt-sources 
 
 采集仍按每步重算完整前缀的方式进行，512 token 会明显增加计算量。增加样本量能改善路由与回放统计，不能据此得出真实 KV-cached decode 或端到端加速结论。
 
-## 1. 租用单卡并传代码
+## 服务器与环境
+
+### 租用单卡并传代码
 
 以下为两台校内服务器的只读查询结果，适合对照租用实例的实际 GPU 型号和驱动。
 
@@ -55,13 +105,13 @@ python scripts/prepare_expanded_prompts.py --cache /tmp/loop-moe-prompt-sources 
 
 ```bash
 GPU_HOST=user@rented-host
-rsync -av --exclude='__pycache__/' README.md requirements-gpu.txt configs loop_moe scripts "$GPU_HOST:loop-moe/"
+rsync -av --exclude='__pycache__/' README.md requirements-gpu.txt environment-replay.yml configs loop_moe scripts tests "$GPU_HOST:loop-moe/"
 ssh "$GPU_HOST"
 ```
 
 如果平台分配了单独的 SSH 端口，`rsync` 加 `-e 'ssh -p 端口'`，`ssh` 加 `-p 端口`。
 
-## 2. 在租用实例配置环境
+### 在租用实例配置依赖
 
 如果平台提供以下两种基础镜像，优先选择 **PyTorch 2.12.1 / Python 3.12 / Ubuntu 22.04 / CUDA 13.0**。无需自制镜像；进入后新建下面的 Python 3.11 环境，按脚本安装本项目已验证的版本。基础镜像预装的 Python/PyTorch 与实验环境可以不同，不直接复用其 2.12.1 环境。
 
@@ -86,11 +136,11 @@ bash scripts/setup_gpu.sh cu130
 python -m unittest discover -s tests -v
 ```
 
-脚本安装 `torch==2.13.0` 对应的 CUDA 构建、`transformers==5.15.0` 和 `einops==0.8.2`。模型代码与权重固定在 `configs/foil_pilot.json` 所列的 Hugging Face revision，首次运行自动下载所选模型的文件。两个模型的权重各约 1.1 GB，另需为 PyTorch 安装和缓存留空间。若系统盘空间有限，先将 `HF_HOME` 指到实例的可写数据盘。模型由发布者提供的自定义 Python 实现加载。 [Foil 模型卡](https://huggingface.co/ShourenWSR/how-to-loop-moe)
+脚本安装 `torch==2.13.0` 对应的 CUDA 构建、`transformers==5.15.0` 和 `einops==0.8.2`。`cu130` 的原生 CUDA 组件另按 `configs/native-cu130-validated.txt` 固定为已验证版本。模型代码与权重固定在 `configs/foil_pilot.json` 所列的 Hugging Face revision，首次运行自动下载所选模型的文件。两个模型的权重各约 1.1 GB，另需为 PyTorch 安装和缓存留空间。若系统盘空间有限，先将 `HF_HOME` 指到实例的可写数据盘。模型由发布者提供的自定义 Python 实现加载。 [Foil 模型卡](https://huggingface.co/ShourenWSR/how-to-loop-moe)
 
-## 3. 先小跑，再跑试验
+## 试跑与路由采集
 
-以下命令使用第一个可见 GPU。使用有作业调度器的实例时，保留调度器分配的 `CUDA_VISIBLE_DEVICES`。
+试跑配置默认使用 Foil-1 和 Foil-3，包含文本、数学、代码各 6 条请求，采用 BF16、batch=1、greedy decoding，最多生成 128 个新 token。采集使用第一个可见 GPU。使用共享服务器时先确认对应 GPU 空闲，使用有作业调度器的实例时保留调度器分配的 `CUDA_VISIBLE_DEVICES`。
 
 ```bash
 # 两条 prompt、最多生成 4 token，验证下载、加载、GPU 算子、导出和回放
@@ -133,13 +183,13 @@ python -m loop_moe.analyze runs/pilot/Foil-1/trace.jsonl.gz --out-dir runs/pilot
 python -m loop_moe.replay runs/pilot/Foil-1/trace.jsonl.gz --out-dir runs/pilot/Foil-1/replay
 ```
 
-## 4. 看结果
+## 输出与基础回放
 
 每个 checkpoint 有自己的输出子目录。
 
 | 文件 | 内容 |
 | --- | --- |
-| `trace.jsonl.gz` | 首行记录模型、环境、物理专家池和真实 BF16 权重字节数。之后每行一个请求，含输入/生成 token 和按 forward、展开深度记录的路由。 |
+| `trace.jsonl.gz` | 首行记录模型、环境、物理专家池和按各模型实际精度计算的权重字节数。之后每行一个请求，含输入/生成 token 和按 forward、展开深度记录的路由。 |
 | `analysis/routing.csv` | 按 prefill/decode、类别、物理层和 loop 转移统计 overlap、Jaccard、交集大小分布，以及相邻 loop 的 block 输出 cosine。`marginal_null_overlap` 是保持两边边缘频率后独立重配对的期望。 |
 | `analysis/routing_heatmap.html` | 浏览器可直接打开，按物理层和 loop 转移查看 overlap 和 Jaccard 热图。 |
 | `analysis/confidence.csv` | 上一轮 gate margin 或归一化熵分桶后，对应下一轮 overlap。margin 切点为 `.01/.025/.05/.1/.2`，熵切点为 `.2/.4/.6/.8/.9`，桶号从 0 开始。 |
@@ -157,13 +207,12 @@ python -m loop_moe.replay runs/pilot/Foil-1/trace.jsonl.gz --out-dir runs/pilot/
 
 ```bash
 python3 -m unittest discover -s tests -v
-bash -n scripts/setup_gpu.sh
-bash -n scripts/run_pilot.sh
+for script in scripts/*.sh; do bash -n "$script" || break; done
 ```
 
-这些检查只读合成轨迹和脚本。第一次真实生成由租用实例上的 `runs/smoke` 验证。
+在 Mac 上先激活 Python 3.11 环境，再运行合成测试和语法检查。模型小跑在服务器执行。
 
-## 5. 下一次同池访问的驻留实验
+## 下一次同池访问的驻留实验
 
 [方法设计](docs/loop-aware-expert-residency.md)对应的新入口是 `loop_moe.residency`。它只读已采集轨迹，**不加载模型、不需要 GPU**，使用 Python 3.11 和标准库。原来的 `loop_moe.replay` 保留用于复查历史结果。
 

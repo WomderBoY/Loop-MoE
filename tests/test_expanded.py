@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from loop_moe.expanded import check_gpu, merge_model, preflight, prepare, sha256, validate_shard
+from loop_moe.expanded import check_gpu, merge_model, preflight, prepare, run, sha256, validate_shard, worker_plan
 from loop_moe.trace import SCHEMA_VERSION, TRACE_SCOPE, read_trace, write_line
 
 
@@ -93,6 +93,94 @@ class ExpandedTests(unittest.TestCase):
                 (root / "config.json").write_text('{"max_position_embeddings": 1024}')
                 result = preflight(config, [{"id": "long-chat", "text": "Prompt text"}])
                 self.assertEqual(result[0]["max_prompt_tokens"], 176)
+
+    @patch("loop_moe.expanded.subprocess.run")
+    def test_parallel_models_allow_only_the_drivers_own_pids(self, run):
+        gpu = {"index": "0", "uuid": "GPU-test"}
+        run.return_value = subprocess.CompletedProcess([], 0,
+            "GPU-test, 101\nGPU-test, 102\nGPU-test, 103\nGPU-test, 104\n", "")
+        check_gpu(gpu, own_pids={101, 102, 103, 104})
+        with self.assertRaisesRegex(RuntimeError, "occupied"):
+            check_gpu(gpu, own_pids={101, 102, 103})
+        run.return_value.stdout += "GPU-other, 999\n"
+        check_gpu(gpu, own_pids={101, 102, 103, 104})
+
+    def test_parallel_plan_uses_each_model_once_on_a_single_gpu(self):
+        models = ["Loopie-6B", "Foil-1", "Foil-3", "Looped-MoE"]
+        gpu = {"index": "0", "uuid": "GPU-test"}
+        self.assertEqual(worker_plan(models, [gpu], True), [(gpu, model) for model in models])
+        self.assertEqual(worker_plan(models, [gpu], False), [(gpu, None)])
+
+    def test_four_model_driver_reaches_four_concurrent_children_without_gpu(self):
+        """Exercise actual thread coordination with simulated child processes/NVML."""
+        from loop_moe.expanded import save_json
+        from loop_moe.trace import read_jsonl
+        live = set()
+        spawned = []
+        peak = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            models = ["one", "two", "three", "four"]
+            checkpoint = {"repo": "test/model", "revision": "fixed", "architecture": "foil", "dtype": "bfloat16"}
+            config = {"models": models, "checkpoints": {name: checkpoint for name in models},
+                      "prompts": "prompts.jsonl", "shard_size": 24, "max_new_tokens": 512}
+            save_json(root / "config.json", config)
+            (root / "prompts.jsonl").write_text('{"id":"a","category":"text","text":"A prompt"}\n')
+            gpu = {"index": "0", "uuid": "GPU-test", "memory_mib": 0}
+
+            class Child:
+                def __init__(self, command, **kwargs):
+                    self.pid = 101 + len(spawned)
+                    self.returncode = None
+                    model = command[command.index("--model") + 1]
+                    prompt_path = Path(command[command.index("--prompts") + 1])
+                    out_dir = Path(command[command.index("--out-dir") + 1]) / model
+                    out_dir.mkdir(parents=True)
+                    prompts = list(read_jsonl(prompt_path))
+                    with gzip.open(out_dir / "trace.jsonl.gz", "wt") as stream:
+                        write_line(stream, dict(checkpoint, model=model, schema_version=SCHEMA_VERSION,
+                                                trace_scope=TRACE_SCOPE, request_count=len(prompts),
+                                                prompts_sha256=sha256(prompt_path), max_new_tokens=512))
+                        for prompt in prompts:
+                            write_line(stream, {"request_id": prompt["id"]})
+                    spawned.append(model)
+                    live.add(self.pid)
+                    peak.append(len(live))
+
+                def poll(self):
+                    if len(spawned) == 4:
+                        live.discard(self.pid)
+                        self.returncode = 0
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = -15
+                    live.discard(self.pid)
+
+                def wait(self, **kwargs):
+                    return self.returncode
+
+            def nvml(command, **kwargs):
+                self.assertIn("--query-compute-apps=gpu_uuid,pid", command)
+                return subprocess.CompletedProcess(command, 0,
+                    "".join(f"GPU-test, {pid + 10000}\n" for pid in sorted(live)), "")
+
+            args = SimpleNamespace(config=root / "config.json", out_dir=root / "out",
+                                   gpus=["0"], parallel_models=True, exclusive_gpu=True, preflight_only=False)
+            with patch("loop_moe.expanded.preflight", return_value=[]), \
+                    patch("loop_moe.expanded.gpu_inventory", return_value=[gpu]), \
+                    patch("loop_moe.expanded.subprocess.run", side_effect=nvml), \
+                    patch("loop_moe.expanded.subprocess.Popen", side_effect=Child), \
+                    patch("loop_moe.expanded.finish") as finish:
+                run(args)
+            status = __import__("json").loads((root / "out/status.json").read_text())
+            self.assertEqual(status["phase"], "complete")
+            self.assertEqual(len(status["completed_this_run"]), 4)
+            self.assertEqual(max(peak), 4)
+            self.assertCountEqual(spawned, models)
+            self.assertFalse(live)
+            finish.assert_called_once()
 
 
 if __name__ == "__main__":

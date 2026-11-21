@@ -1,3 +1,25 @@
+# macOS and editor metadata
+.DS_Store
+/.idea/
+/.vscode/
+
+# Python environments, caches and test output
 /.venv/
-/runs/
+/venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+/htmlcov/
+
+# Local credentials and downloaded assets
+/.env
+/.env.local
+/.cache/
+
+# Experiment data and presentation output
+/runs/
+/slides/
+/.presentation-validation/

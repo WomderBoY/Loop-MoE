@@ -45,19 +45,29 @@ def gpu_inventory():
             for index, uuid, memory in (line.split(",") for line in result.stdout.splitlines())]
 
 
-def check_gpu(gpu, own_pid=None):
+def check_gpu(gpu, own_pid=None, *, own_pids=()):
+    allowed = set(own_pids)
+    if own_pid is not None:
+        allowed.add(own_pid)
     result = subprocess.run([
         "nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits",
     ], check=True, text=True, capture_output=True, timeout=15)
     foreign = [line.strip() for line in result.stdout.splitlines()
                if line.split(",")[0].strip() == gpu["uuid"]
-               and int(line.split(",")[1]) != own_pid]
+               and int(line.split(",")[1]) not in allowed]
     if foreign:
         raise RuntimeError(f"GPU {gpu['index']} is occupied by another process: {foreign}; stopping our jobs")
-    if own_pid is None:
+    if not allowed:
         current = next(row for row in gpu_inventory() if row["uuid"] == gpu["uuid"])
         if current["memory_mib"] > 32:
             raise RuntimeError(f"GPU {gpu['index']} has {current['memory_mib']} MiB in use; refusing to start")
+
+
+def worker_plan(models, gpus, parallel_models):
+    """Give each concurrent model its own lane; never run two copies of one model."""
+    if parallel_models:
+        return [(gpus[index % len(gpus)], model) for index, model in enumerate(models)]
+    return [(gpu, None) for gpu in gpus]
 
 
 def prepare(config_path, out_dir):
@@ -206,6 +216,8 @@ def run(args):
             return
         if not args.gpus or len(args.gpus) > 2 or len(set(args.gpus)) != len(args.gpus):
             raise ValueError("Specify one or two distinct GPUs via --gpus")
+        if args.exclusive_gpu and len(args.gpus) != 1:
+            raise ValueError("--exclusive-gpu is only for one dedicated, allocated GPU")
         inventory = gpu_inventory()
         selected = [next(row for row in inventory if gpu in (row["index"], row["uuid"])) for gpu in args.gpus]
         if len({row["uuid"] for row in selected}) != len(selected):
@@ -217,28 +229,42 @@ def run(args):
                 locks.append(lock)
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 check_gpu(gpu)
-            tasks = queue.Queue()
+            if args.parallel_models:
+                task_queues = {model: queue.Queue() for model in config["models"]}
+            else:
+                task_queues = {None: queue.Queue()}
             for shard in shards:
                 for model in config["models"]:
                     path = args.out_dir / "shards" / shard.stem / model / "trace.jsonl.gz"
                     if path.exists():
                         validate_shard(path, config, model, shard)
                     else:
-                        tasks.put((model, shard))
+                        task_queues[model if args.parallel_models else None].put((model, shard))
+            def pending_count():
+                return sum(tasks.qsize() for tasks in task_queues.values())
+
+            gpu_locks = {gpu["uuid"]: threading.Lock() for gpu in selected}
+            owned_pids = {gpu["uuid"]: set() for gpu in selected}
+            plan = worker_plan(config["models"], selected, args.parallel_models)
             stop = threading.Event()
             state_lock = threading.Lock()
             state = {"started_at": timestamp(), "phase": "collecting", "gpus": selected,
-                     "pending_shards": tasks.qsize(), "active": {}, "completed_this_run": []}
+                     "parallel_models": args.parallel_models, "worker_count": len(plan),
+                     "exclusive_gpu": args.exclusive_gpu,
+                     "pending_shards": pending_count(), "active": {}, "completed_this_run": []}
             save_json(args.out_dir / "status.json", state)
 
-            def worker(gpu):
+            def worker(gpu, lane):
+                tasks = task_queues[lane]
+                worker_key = f"{gpu['index']}:{lane}" if lane else gpu["index"]
+                gpu_lock = gpu_locks[gpu["uuid"]]
+                gpu_pids = owned_pids[gpu["uuid"]]
                 try:
                     while not stop.is_set():
                         try:
                             model, shard = tasks.get_nowait()
                         except queue.Empty:
                             return
-                        check_gpu(gpu)
                         command = [sys.executable, "-u", "-m", "loop_moe.collect", "--config", str(args.config),
                                    "--model", model, "--prompts", str(shard), "--local-files-only",
                                    "--out-dir", str(args.out_dir / "shards" / shard.stem)]
@@ -248,18 +274,31 @@ def run(args):
                         with log_path.open("a", encoding="utf-8") as log:
                             log.write(f"\nStarted {timestamp()} on GPU {gpu['index']} ({gpu['uuid']})\n")
                             log.flush()
-                            process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log,
-                                                       stderr=subprocess.STDOUT)
+                            # Serialize the check/spawn/register sequence on each GPU.
+                            # Shared servers allow only this driver's registered PIDs.
+                            # Dedicated containers check idle before starting and
+                            # rely on their allocated device while workers run.
+                            with gpu_lock:
+                                if not args.exclusive_gpu or not gpu_pids:
+                                    check_gpu(gpu, own_pids=gpu_pids)
+                                if stop.is_set():
+                                    return
+                                process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log,
+                                                           stderr=subprocess.STDOUT)
+                                gpu_pids.add(process.pid)
                             with state_lock:
-                                state["active"][gpu["index"]] = {"model": model, "shard": shard.stem,
+                                state["active"][worker_key] = {"model": model, "shard": shard.stem,
+                                                               "gpu_index": gpu["index"],
                                                                "pid": process.pid, "started_at": timestamp()}
-                                state["pending_shards"] = tasks.qsize()
+                                state["pending_shards"] = pending_count()
                                 save_json(args.out_dir / "status.json", state)
                             try:
                                 while process.poll() is None:
                                     if stop.wait(5):
                                         raise RuntimeError("Another worker stopped; halting our collection")
-                                    check_gpu(gpu, process.pid)
+                                    if not args.exclusive_gpu:
+                                        with gpu_lock:
+                                            check_gpu(gpu, own_pids=gpu_pids)
                                 if process.returncode:
                                     raise RuntimeError(f"{model} shard {shard.stem} failed: see {log_path}")
                             except BaseException:
@@ -271,10 +310,13 @@ def run(args):
                                         process.kill()
                                         process.wait()
                                 raise
+                            finally:
+                                with gpu_lock:
+                                    gpu_pids.discard(process.pid)
                         validate_shard(args.out_dir / "shards" / shard.stem / model / "trace.jsonl.gz",
                                        config, model, shard)
                         with state_lock:
-                            state["active"].pop(gpu["index"])
+                            state["active"].pop(worker_key)
                             state["completed_this_run"].append({"model": model, "shard": shard.stem})
                             save_json(args.out_dir / "status.json", state)
                         print(f"Completed {model}/{shard.stem} on GPU {gpu['index']}", flush=True)
@@ -282,8 +324,8 @@ def run(args):
                     stop.set()
                     raise
 
-            with ThreadPoolExecutor(max_workers=len(selected)) as pool:
-                futures = [pool.submit(worker, gpu) for gpu in selected]
+            with ThreadPoolExecutor(max_workers=len(plan)) as pool:
+                futures = [pool.submit(worker, gpu, lane) for gpu, lane in plan]
                 errors = []
                 for future in futures:
                     try:
@@ -317,6 +359,11 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("configs/expanded.json"))
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--gpus", nargs="+")
+    parser.add_argument("--parallel-models", action="store_true",
+                        help="Run one worker per model; --gpus 0 uses one GPU for all four models")
+    parser.add_argument("--exclusive-gpu", action="store_true",
+                        help="Dedicated rental GPU: check idle before starting; rely on allocation isolation "
+                             "while workers run, since container and NVML PIDs can differ")
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
     run(args)

@@ -9,7 +9,11 @@ case "$cuda_build" in
 esac
 
 python -c 'import sys; assert sys.version_info[:2] == (3, 11), "Activate a Python 3.11 environment first"'
+constraints=()
+if [[ "$cuda_build" == cu130 ]]; then
+  constraints=(--constraint configs/native-cu130-validated.txt)
+fi
 python -m pip install --upgrade 'pip==26.2.1'
-python -m pip install "torch==2.13.0+$cuda_build" --index-url "https://download.pytorch.org/whl/$cuda_build"
+python -m pip install "torch==2.13.0+$cuda_build" --index-url "https://download.pytorch.org/whl/$cuda_build" "${constraints[@]}"
 python -m pip install -r requirements-gpu.txt
 python -m pip check
