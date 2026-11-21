@@ -136,6 +136,28 @@ def _make_synthetic_ifm_trace(path: Path, *, arch: str, n_requests: int = 6, n_s
 
 
 class TestIFMA1A3(unittest.TestCase):
+    def test_shim_inspect_compat(self) -> None:
+        import inspect
+        import sys
+        import types
+
+        # Verify dunder-safe __getattr__ on dynamic shim modules (matches ifm_runtime.py)
+        mod = types.ModuleType("_dummy_shim_ops")
+        mod.__file__ = __file__
+
+        def _ga(name: str):
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            return lambda *a, **kw: None
+
+        mod.__getattr__ = _ga  # type: ignore[attr-defined]
+        sys.modules["_dummy_shim_ops"] = mod
+        try:
+            self.assertEqual(inspect.getsourcefile(mod), __file__)
+            self.assertIsNotNone(inspect.getmodule(TestIFMA1A3))
+        finally:
+            sys.modules.pop("_dummy_shim_ops", None)
+
     def test_prompts_and_graders(self) -> None:
         math_prompt, stops = format_ifm_prompt({"id": "m1", "category": "math", "question": "What is 2+2?"})
         self.assertIn("Q: What is 2+2?\nA:", math_prompt)

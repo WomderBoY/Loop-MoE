@@ -21,12 +21,14 @@ echo "[setup] PYTHON_BIN=$PYTHON_BIN"
 echo "[setup] XLLM_LOOP_DIR=$XLLM_LOOP_DIR"
 
 # Install lightweight pure-Python packages needed by xllm-loop if missing
-"$PYTHON_BIN" - <<'PY' || "$PYTHON_BIN" -m pip install -q --no-cache-dir \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple \
-  einops tiktoken==0.8.0 sentencepiece blobfile "typeguard>=4.5.0" fire pyarrow
-import einops, tiktoken, sentencepiece, blobfile, typeguard, fire, pyarrow
-print("[setup] All Python deps already present.")
-PY
+if ! "$PYTHON_BIN" -c 'import einops, tiktoken, sentencepiece, blobfile, typeguard, fire, pyarrow, submitit, pynvml, nltk, rouge_score, tensorboard, wandb' 2>/dev/null; then
+  echo "[setup] Installing missing lightweight Python deps..."
+  "$PYTHON_BIN" -m pip install -q --no-cache-dir \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r "$ROOT_DIR/requirements-ifm.txt"
+else
+  echo "[setup] All Python deps already present."
+fi
 
 # Clone and pin official ifm-ai/xllm-loop
 if [[ ! -d "$XLLM_LOOP_DIR/.git" ]]; then

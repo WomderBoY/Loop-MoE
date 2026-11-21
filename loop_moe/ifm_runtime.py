@@ -30,6 +30,9 @@ def _install_xllm_extension_shim() -> bool:
     ext = types.ModuleType("xllm_extension")
     ops = types.ModuleType("xllm_extension.ops")
     te = types.ModuleType("xllm_extension.te")
+    ext.__file__ = __file__
+    ops.__file__ = __file__
+    te.__file__ = __file__
 
     def group_rms_norm_fwd_affine(
         x: torch.Tensor,
@@ -89,7 +92,14 @@ def _install_xllm_extension_shim() -> bool:
         return _stub
 
     def _ops_getattr(name: str):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return _missing_op(name)
+
+    def _te_getattr(name: str):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return _missing_op(f"te.{name}")
 
     ops.__getattr__ = _ops_getattr  # type: ignore[attr-defined]
 
@@ -103,7 +113,7 @@ def _install_xllm_extension_shim() -> bool:
         kBFloat16 = 6
 
     te.DType = _DType
-    te.__getattr__ = lambda name: _missing_op(f"te.{name}")  # type: ignore[attr-defined]
+    te.__getattr__ = _te_getattr  # type: ignore[attr-defined]
 
     ext.ops = ops
     ext.te = te
@@ -165,6 +175,7 @@ def bootstrap_xllm(xllm_loop_dir: str | Path, attention_backend: str = "sdpa") -
         import flash_attn_2_cuda  # noqa: F401
     except ImportError:
         stub = types.ModuleType("flash_attn_2_cuda")
+        stub.__file__ = __file__
         sys.modules["flash_attn_2_cuda"] = stub
         used_fa_shim = True
 
