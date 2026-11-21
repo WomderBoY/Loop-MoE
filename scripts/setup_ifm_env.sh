@@ -29,20 +29,24 @@ if ! "$PYTHON_BIN" -c 'import einops, tiktoken, sentencepiece, blobfile, typegua
     submitit nvidia-ml-py nltk rouge_score tensorboard wandb
 fi
 
-if ! "$PYTHON_BIN" -c 'import fla' 2>/dev/null; then
-  echo "[setup] Installing flash-linear-attention (--no-deps to preserve torch+cu130)..."
+if ! "$PYTHON_BIN" -c 'from fla.modules.conv.triton import causal_conv1d_fwd; from fla.ops.utils import prepare_chunk_indices' 2>/dev/null; then
+  echo "[setup] Installing fla-core and flash-linear-attention (--no-deps to preserve torch+cu130)..."
   "$PYTHON_BIN" -m pip install -q --no-cache-dir --no-deps \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    flash-linear-attention
+    fla-core flash-linear-attention
 fi
 echo "[setup] All Python deps ready."
 
-# Clone and pin official ifm-ai/xllm-loop
+# Clone and pin official ifm-ai/xllm-loop (skip network fetch when already pinned locally)
 if [[ ! -d "$XLLM_LOOP_DIR/.git" ]]; then
   git clone --no-checkout https://github.com/ifm-ai/xllm-loop.git "$XLLM_LOOP_DIR"
 fi
-git -C "$XLLM_LOOP_DIR" fetch --depth 1 origin "$XLLM_COMMIT" 2>/dev/null || git -C "$XLLM_LOOP_DIR" fetch origin
-git -C "$XLLM_LOOP_DIR" checkout -q "$XLLM_COMMIT"
+if [[ "$(git -C "$XLLM_LOOP_DIR" rev-parse HEAD 2>/dev/null || true)" != "$XLLM_COMMIT" ]]; then
+  if ! git -C "$XLLM_LOOP_DIR" cat-file -e "${XLLM_COMMIT}^{commit}" 2>/dev/null; then
+    git -C "$XLLM_LOOP_DIR" fetch --depth 1 origin "$XLLM_COMMIT" 2>/dev/null || git -C "$XLLM_LOOP_DIR" fetch origin
+  fi
+  git -C "$XLLM_LOOP_DIR" checkout -q "$XLLM_COMMIT"
+fi
 echo "[setup] xllm-loop pinned at $(git -C "$XLLM_LOOP_DIR" rev-parse HEAD)"
 
 # Quick import sanity check with pure-PyTorch shims (no GPU touched)
