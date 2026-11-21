@@ -90,6 +90,7 @@ def _artifact_files_complete(target_dir: Path) -> bool:
 
 
 def download_ifm_artifact(repo_id: str, model_root: Path, local_files_only: bool = False) -> Path:
+    import shutil
     from huggingface_hub import snapshot_download
 
     target_dir = model_root / repo_id.replace("/", "__")
@@ -99,7 +100,63 @@ def download_ifm_artifact(repo_id: str, model_root: Path, local_files_only: bool
         return target_dir
     if local_files_only:
         raise FileNotFoundError(f"Incomplete or missing local artifact: {target_dir}")
-    print(f"[download] Downloading {repo_id} -> {target_dir} ...", flush=True)
+
+    # Fast-path: if artifact_manifest.json is already present and aria2c is available,
+    # fetch only missing/incomplete files with resumable multi-connection aria2c so
+    # hf-mirror.com's slow /api/resolve-cache metadata endpoint is bypassed cleanly.
+    manifest_path = target_dir / "artifact_manifest.json"
+    aria2 = shutil.which("aria2c")
+    if manifest_path.is_file() and aria2:
+        endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        manifest = read_json(manifest_path)
+        missing = []
+        for rec in manifest.get("files", []):
+            rel = rec["path"]
+            expected_size = int(rec["size_bytes"])
+            fpath = target_dir / rel
+            if not fpath.is_file() or fpath.stat().st_size != expected_size:
+                missing.append((rel, expected_size))
+        if missing:
+            print(f"[download] aria2c fetching {len(missing)} missing files for {repo_id} via {endpoint} ...", flush=True)
+            input_lines = []
+            for rel, _sz in missing:
+                (target_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+                url = f"{endpoint}/{repo_id}/resolve/main/{rel}"
+                input_lines.append(url)
+                input_lines.append(f"  dir={target_dir}")
+                input_lines.append(f"  out={rel}")
+                if token:
+                    input_lines.append(f"  header=Authorization: Bearer {token}")
+            list_file = target_dir / ".aria2_download_list.txt"
+            list_file.write_text("\n".join(input_lines) + "\n", encoding="utf-8")
+            try:
+                cmd = [
+                    aria2,
+                    "-i", str(list_file),
+                    "-j", "4",
+                    "-x", "16",
+                    "-s", "16",
+                    "-k", "4M",
+                    "-c",
+                    "--auto-file-renaming=false",
+                    "--allow-overwrite=true",
+                    "--max-tries=10",
+                    "--retry-wait=3",
+                    "--connect-timeout=20",
+                    "--timeout=60",
+                    "--summary-interval=15",
+                    "--console-log-level=warn",
+                ]
+                subprocess.run(cmd, check=True)
+            finally:
+                list_file.unlink(missing_ok=True)
+        if _artifact_files_complete(target_dir):
+            print(f"[download] Verified complete artifact via aria2c: {target_dir}", flush=True)
+            return target_dir
+
+    print(f"[download] Downloading {repo_id} -> {target_dir} via huggingface_hub ...", flush=True)
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(target_dir),

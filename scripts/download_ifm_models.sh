@@ -19,6 +19,7 @@ XLLM_LOOP_DIR="${XLLM_LOOP_DIR:-$STORAGE_BASE/xllm-loop}"
 CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/configs/ifm_a1_a3.json}"
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 export HF_HOME="${HF_HOME:-$STORAGE_BASE/hf_cache}"
 mkdir -p "$IFM_MODEL_DIR" "$HF_HOME"
