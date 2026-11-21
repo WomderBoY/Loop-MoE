@@ -1,0 +1,69 @@
+{
+  "experiment": "ifm_part1_a1_a3",
+  "mode": "smoke",
+  "xllm_loop_repo": "https://github.com/ifm-ai/xllm-loop.git",
+  "xllm_loop_commit": "755c7b3a91081fe0f83500eabd53bd2490b8b745",
+  "models": [
+    "IFM-Ouro-500B",
+    "IFM-Huginn-500B"
+  ],
+  "checkpoints": {
+    "IFM-Ouro-500B": {
+      "repo": "IFM/LoopedLM-P1-moe-ouro-500b",
+      "arch": "transformer",
+      "expected_pools": 28,
+      "expected_visits": 112,
+      "expected_loops": 4,
+      "prelude_layers": [0, 0],
+      "recurrent_layers": [0, 28],
+      "coda_layers": [28, 28],
+      "num_experts": 25,
+      "top_k": 2,
+      "bytes_per_expert": 22413312
+    },
+    "IFM-Huginn-500B": {
+      "repo": "IFM/LoopedLM-P1-moe-huginn-500b",
+      "arch": "huginn",
+      "expected_pools": 28,
+      "expected_visits": 112,
+      "expected_loops": 8,
+      "prelude_layers": [0, 8],
+      "recurrent_layers": [8, 20],
+      "coda_layers": [20, 28],
+      "num_experts": 25,
+      "top_k": 2,
+      "bytes_per_expert": 22413312
+    }
+  },
+  "prompts_file": "configs/ifm_prompts_smoke.jsonl",
+  "fixed_prompts_file": "configs/ifm_fixed_smoke.jsonl",
+  "max_new_tokens": 128,
+  "max_prompt_len": 1024,
+  "fixed_continuation_tokens": 128,
+  "top_candidates": 6,
+  "attention_backend": "sdpa",
+  "verify_exact_attention": true,
+  "split": {
+    "fit_ratio": 0.3333333333,
+    "val_ratio": 0.1666666667,
+    "eval_ratio": 0.5,
+    "seed": 20261121
+  },
+  "a2": {
+    "score_alpha": 0.2,
+    "shrinkage": 16.0,
+    "max_table_cells": 4096,
+    "shuffle_seed": 20261121,
+    "candidate_ks": [2, 4, 6],
+    "bootstrap_samples": 1000
+  },
+  "a3": {
+    "budgets_experts": [95, 191, 287, 300, 302, 383, 479, 574, 700],
+    "memory_mode": "peak",
+    "score_alpha": 0.2,
+    "oled_update_tokens": 5,
+    "non_expert_gib": 1.75,
+    "kv_kib_per_token": 168.0,
+    "bootstrap_samples": 1000
+  }
+}
