@@ -364,6 +364,8 @@ def collect_for_model(
     out_dir: Path,
     local_files_only: bool,
     progress_cb=None,
+    shard_idx: int | None = None,
+    num_shards: int = 1,
 ) -> dict[str, Any]:
     import torch
     from .ifm_runtime import bootstrap_xllm, ifm_route_collector, load_ifm_model, verify_attention_backend
@@ -379,34 +381,29 @@ def collect_for_model(
         attention_backend=cfg.get("attention_backend", "sdpa"),
     )
 
+    is_sharded = shard_idx is not None and num_shards > 1
+    run_aux = (not is_sharded) or (shard_idx == 0)
+
     attn_check = None
-    if cfg.get("verify_exact_attention", True):
+    if run_aux and cfg.get("verify_exact_attention", True):
         attn_check = verify_attention_backend(model, tokenizer, spec, device="cuda:0")
         print(f"[{model_name}] attention verification: {json.dumps(attn_check)}", flush=True)
 
     prompts_path = Path(cfg["prompts_file"])
     fixed_path = Path(cfg["fixed_prompts_file"])
-    prompts = list(read_jsonl(prompts_path))
+    all_prompts = list(read_jsonl(prompts_path))
+    prompts = all_prompts[shard_idx::num_shards] if is_sharded else all_prompts
     fixed_items = list(read_jsonl(fixed_path))
 
     model_out = out_dir / model_name
+    if is_sharded:
+        write_out = model_out / "shards" / f"shard_{shard_idx:02d}"
+    else:
+        write_out = model_out
+    write_out.mkdir(parents=True, exist_ok=True)
     model_out.mkdir(parents=True, exist_ok=True)
 
-    split_cfg = cfg["split"]
-    split_freegen = split_requests_three_way(
-        prompts,
-        fit_ratio=split_cfg["fit_ratio"],
-        val_ratio=split_cfg["val_ratio"],
-        seed=split_cfg["seed"],
-    )
-    split_fixed = split_requests_three_way(
-        fixed_items,
-        fit_ratio=0.5,
-        val_ratio=0.0,
-        seed=split_cfg["seed"],
-    )
-
-    freegen_trace_path = model_out / "trace_freegen.jsonl.gz"
+    freegen_trace_path = write_out / "trace_freegen.jsonl.gz"
     fixed_trace_path = model_out / "trace_fixed.jsonl.gz"
 
     with ifm_route_collector(model, spec, top_candidates=int(cfg.get("top_candidates", 6))) as (
@@ -461,8 +458,9 @@ def collect_for_model(
                 write_line(stream, rec)
                 freegen_records.append(rec)
                 q = rec["quality"]
+                tag = f"s{shard_idx} " if is_sharded else ""
                 print(
-                    f"[{model_name} freegen {idx}/{len(prompts)}] {item['id']} "
+                    f"[{model_name} freegen {tag}{idx}/{len(prompts)}] {item['id']} "
                     f"toks={q['output_tokens']} stop={rec['stop_reason']} "
                     f"rep4={q['rep4_rate']:.3f} ok={q['correct']} ({q['ms_per_step']:.1f} ms/tok)",
                     flush=True,
@@ -472,44 +470,100 @@ def collect_for_model(
 
         fixed_records: list[dict[str, Any]] = []
         stepwise_check = None
-        with gzip.open(fixed_trace_path, "wt", encoding="utf-8") as stream:
-            write_line(
-                stream,
-                {
-                    **base_meta,
-                    "mode": "fixed",
-                    "request_count": len(fixed_items),
-                    "prompts_sha256": hashlib.sha256(fixed_path.read_bytes()).hexdigest(),
-                    "continuation_tokens": int(cfg["fixed_continuation_tokens"]),
-                },
-            )
-            for idx, item in enumerate(fixed_items, start=1):
-                rec, sw = _collect_fixed_request(
-                    torch,
-                    tokenizer,
-                    fwd_capture,
-                    item,
-                    continuation_tokens=int(cfg["fixed_continuation_tokens"]),
-                    device="cuda:0",
-                    verify_stepwise=(idx == 1),
+        if run_aux:
+            with gzip.open(fixed_trace_path, "wt", encoding="utf-8") as stream:
+                write_line(
+                    stream,
+                    {
+                        **base_meta,
+                        "mode": "fixed",
+                        "request_count": len(fixed_items),
+                        "prompts_sha256": hashlib.sha256(fixed_path.read_bytes()).hexdigest(),
+                        "continuation_tokens": int(cfg["fixed_continuation_tokens"]),
+                    },
                 )
-                if sw is not None:
-                    stepwise_check = sw
-                    print(f"[{model_name}] fixed single-pass vs stepwise check: {json.dumps(sw)}", flush=True)
-                write_line(stream, rec)
-                fixed_records.append(rec)
+                for idx, item in enumerate(fixed_items, start=1):
+                    rec, sw = _collect_fixed_request(
+                        torch,
+                        tokenizer,
+                        fwd_capture,
+                        item,
+                        continuation_tokens=int(cfg["fixed_continuation_tokens"]),
+                        device="cuda:0",
+                        verify_stepwise=(idx == 1),
+                    )
+                    if sw is not None:
+                        stepwise_check = sw
+                        print(f"[{model_name}] fixed single-pass vs stepwise check: {json.dumps(sw)}", flush=True)
+                    write_line(stream, rec)
+                    fixed_records.append(rec)
 
-    # Free GPU memory cleanly before next model
     del model
     torch.cuda.empty_cache()
 
-    # Quality summary
+    if is_sharded:
+        if run_aux:
+            (model_out / "_aux_meta.json").write_text(
+                json.dumps(
+                    {
+                        "attention_verification": attn_check,
+                        "fixed_stepwise_verification": stepwise_check,
+                        "fixed_requests": len(fixed_records),
+                        "expected_visits_per_pos": len(order),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        return {"model": model_name, "shard_idx": shard_idx, "requests": len(freegen_records)}
+
+    return _finalize_model_outputs(
+        cfg,
+        model_name,
+        model_out,
+        all_prompts,
+        fixed_items,
+        freegen_records,
+        len(fixed_records),
+        len(order),
+        attn_check,
+        stepwise_check,
+    )
+
+
+def _finalize_model_outputs(
+    cfg: dict[str, Any],
+    model_name: str,
+    model_out: Path,
+    prompts: list[dict[str, Any]],
+    fixed_items: list[dict[str, Any]],
+    freegen_records: list[dict[str, Any]],
+    fixed_count: int,
+    visits_per_pos: int,
+    attn_check: dict[str, Any] | None,
+    stepwise_check: dict[str, Any] | None,
+) -> dict[str, Any]:
+    split_cfg = cfg["split"]
+    split_freegen = split_requests_three_way(
+        prompts,
+        fit_ratio=split_cfg["fit_ratio"],
+        val_ratio=split_cfg["val_ratio"],
+        seed=split_cfg["seed"],
+    )
+    split_fixed = split_requests_three_way(
+        fixed_items,
+        fit_ratio=0.5,
+        val_ratio=0.0,
+        seed=split_cfg["seed"],
+    )
+
     math_reqs = [r for r in freegen_records if r["category"] == "math" and r["quality"]["correct"] is not None]
     code_reqs = [r for r in freegen_records if r["category"] == "code" and r["quality"]["correct"] is not None]
     quality_summary = {
         "model": model_name,
         "freegen_requests": len(freegen_records),
-        "fixed_requests": len(fixed_records),
+        "fixed_requests": fixed_count,
         "mean_output_tokens": sum(r["quality"]["output_tokens"] for r in freegen_records) / len(freegen_records),
         "mean_ms_per_step": sum(r["quality"]["ms_per_step"] for r in freegen_records) / len(freegen_records),
         "eos_rate": sum(r["quality"]["eos"] for r in freegen_records) / len(freegen_records),
@@ -522,7 +576,7 @@ def collect_for_model(
         "code_n": len(code_reqs),
         "attention_verification": attn_check,
         "fixed_stepwise_verification": stepwise_check,
-        "expected_visits_per_pos": len(order),
+        "expected_visits_per_pos": visits_per_pos,
     }
 
     (model_out / "requests_manifest_freegen.json").write_text(
@@ -534,9 +588,8 @@ def collect_for_model(
     (model_out / "a1_quality_summary.json").write_text(
         json.dumps(quality_summary, indent=2) + "\n", encoding="utf-8"
     )
-    _write_samples_markdown(model_name, freegen_records, model_out / "generation_samples.md")
+    _write_samples_markdown(model_name, freegen_records[:24], model_out / "generation_samples.md")
 
-    # Compact per-request table without heavy visits
     req_table = [
         {
             "request_id": r["request_id"],
@@ -562,6 +615,53 @@ def collect_for_model(
     return quality_summary
 
 
+def _merge_model_shards(cfg: dict[str, Any], model_name: str, out_dir: Path, num_shards: int) -> dict[str, Any]:
+    model_out = out_dir / model_name
+    prompts_path = Path(cfg["prompts_file"])
+    fixed_path = Path(cfg["fixed_prompts_file"])
+    all_prompts = list(read_jsonl(prompts_path))
+    fixed_items = list(read_jsonl(fixed_path))
+    expected_ids = [p["id"] for p in all_prompts]
+
+    base_meta = None
+    by_id: dict[str, dict[str, Any]] = {}
+    for s_idx in range(num_shards):
+        spath = model_out / "shards" / f"shard_{s_idx:02d}" / "trace_freegen.jsonl.gz"
+        recs = read_jsonl(spath)
+        meta = next(recs)
+        if s_idx == 0:
+            base_meta = dict(meta)
+        for r in recs:
+            by_id[r["request_id"]] = r
+
+    if set(by_id) != set(expected_ids):
+        raise RuntimeError(f"Merged shards missing requests for {model_name}: {len(by_id)} != {len(expected_ids)}")
+    ordered = [by_id[rid] for rid in expected_ids]
+    assert base_meta is not None
+    base_meta["request_count"] = len(ordered)
+    base_meta["prompts_sha256"] = hashlib.sha256(prompts_path.read_bytes()).hexdigest()
+
+    merged_path = model_out / "trace_freegen.jsonl.gz"
+    with gzip.open(merged_path, "wt", encoding="utf-8") as stream:
+        write_line(stream, base_meta)
+        for rec in ordered:
+            write_line(stream, rec)
+
+    aux = read_json(model_out / "_aux_meta.json")
+    return _finalize_model_outputs(
+        cfg,
+        model_name,
+        model_out,
+        all_prompts,
+        fixed_items,
+        ordered,
+        int(aux["fixed_requests"]),
+        int(aux["expected_visits_per_pos"]),
+        aux.get("attention_verification"),
+        aux.get("fixed_stepwise_verification"),
+    )
+
+
 def main() -> None:
     import sys
 
@@ -573,6 +673,8 @@ def main() -> None:
     parser.add_argument("--gpu", type=str, default=None, help="Explicit GPU index(es), comma-separated")
     parser.add_argument("--max-gpus", type=int, default=3, help="Max idle GPUs to use concurrently")
     parser.add_argument("--worker-gpu-uuid", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-idx", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--num-shards", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--model", action="append", help="Subset of models to run")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--download-only", action="store_true")
@@ -589,7 +691,7 @@ def main() -> None:
             dl_prog.step(idx)
         return
 
-    # Worker subprocess mode: run single assigned model on assigned idle GPU UUID
+    # Worker subprocess mode: run single assigned model (or shard) on assigned idle GPU UUID
     if args.worker_gpu_uuid is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.worker_gpu_uuid
         assert len(models) == 1
@@ -601,8 +703,10 @@ def main() -> None:
             out_dir=args.out_dir,
             local_files_only=args.local_files_only,
             progress_cb=None,
+            shard_idx=args.shard_idx,
+            num_shards=args.num_shards,
         )
-        print(f"WORKER_DONE {models[0]}", json.dumps(summary), flush=True)
+        print(f"WORKER_DONE {models[0]} shard={args.shard_idx}/{args.num_shards}", json.dumps(summary), flush=True)
         return
 
     # Strict GPU safety check BEFORE touching CUDA
@@ -617,6 +721,85 @@ def main() -> None:
     prompts = list(read_jsonl(Path(cfg["prompts_file"])))
     total_reqs = len(models) * len(prompts)
     prog = orx.progress(total=total_reqs, unit="requests")
+
+    # Multi-GPU prompt sharding when prompt count is large (> 24) and >= 2 idle GPUs exist:
+    # shard each model across ALL available idle GPUs (up to 3) for ~3x speedup!
+    if len(prompts) > 24 and len(idle_gpus) >= 2:
+        import re
+        import threading
+
+        n_shards = len(idle_gpus)
+        done_count = 0
+        done_lock = threading.Lock()
+        step_re = re.compile(r"rep4=([0-9.]+).*\(([0-9.]+) ms/tok\)")
+        summaries: dict[str, Any] = {}
+
+        for model_name in models:
+            errors: list[str] = []
+
+            def _run_shard(s_idx: int, gpu: dict[str, Any]) -> None:
+                nonlocal done_count
+                cmd = [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "loop_moe.ifm_a1_collect",
+                    "--config",
+                    str(args.config),
+                    "--out-dir",
+                    str(args.out_dir),
+                    "--xllm-loop-dir",
+                    str(args.xllm_loop_dir),
+                    "--model-root",
+                    str(args.model_root),
+                    "--model",
+                    model_name,
+                    "--worker-gpu-uuid",
+                    gpu["uuid"],
+                    "--shard-idx",
+                    str(s_idx),
+                    "--num-shards",
+                    str(n_shards),
+                ]
+                if args.local_files_only:
+                    cmd.append("--local-files-only")
+                print(
+                    f"[dispatcher] Launching {model_name} shard {s_idx}/{n_shards} on idle GPU {gpu['index']} ({gpu['uuid']})",
+                    flush=True,
+                )
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+                    if f"[{model_name} freegen " in line:
+                        m = step_re.search(line)
+                        with done_lock:
+                            done_count += 1
+                            if m:
+                                prog.step(done_count, rep4_rate=float(m.group(1)), ms_per_step=float(m.group(2)))
+                            else:
+                                prog.step(done_count)
+                rc = proc.wait()
+                if rc != 0:
+                    with done_lock:
+                        errors.append(f"{model_name} shard {s_idx} on GPU {gpu['index']} exited with code {rc}")
+
+            threads = [
+                threading.Thread(target=_run_shard, args=(s_idx, idle_gpus[s_idx]))
+                for s_idx in range(n_shards)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            summaries[model_name] = _merge_model_shards(cfg, model_name, args.out_dir, n_shards)
+            print(f"[dispatcher] Merged {n_shards} shards for {model_name}", flush=True)
+
+        (args.out_dir / "a1_all_summaries.json").write_text(json.dumps(summaries, indent=2) + "\n", encoding="utf-8")
+        print("A1_COMPLETE", json.dumps(summaries, indent=2), flush=True)
+        return
 
     # Parallel multi-GPU launch when >= 2 models and >= 2 idle GPUs are available
     if len(models) >= 2 and len(idle_gpus) >= 2:

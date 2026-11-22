@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 import json
 import math
+import os
 from pathlib import Path
 import random
 import statistics
@@ -33,6 +35,8 @@ POLICIES = (
     "general_history_distance",
     "loop_a2",
     "loop_a2_distance",
+    "loop_hier_distance",
+    "loop_rem_distance",
     "loop_shuffled_distance",
     "pin_recurrent_lru",
     "pin_recurrent_static_hot",
@@ -167,25 +171,71 @@ def _prepare_request_events(
             p_loop = [0.85 * a + 0.15 * min(1.0, b) for a, b in zip(p_loop, pema)]
 
             # Matched general-history retention score (stage-blind, same lag-1 + lag-H + EMA)
-            gen_comps = [
-                a2._trans_prob(
-                    a2.gen_lag1_trans,
-                    a2.gen_lag1_totals,
-                    [(pool, se) for se in hist[0]],
+            p_gen_lag1 = a2._trans_prob(
+                a2.gen_lag1_trans,
+                a2.gen_lag1_totals,
+                [(pool, se) for se in hist[0]],
+                pool_prior,
+            )
+            gen_comps = [p_gen_lag1]
+            if len(hist) >= h_span:
+                p_gen_lagH = a2._trans_prob(
+                    a2.gen_lagH_trans,
+                    a2.gen_lagH_totals,
+                    [(pool, se) for se in hist[h_span - 1]],
                     pool_prior,
                 )
-            ]
-            if len(hist) >= h_span:
-                gen_comps.append(
-                    a2._trans_prob(
-                        a2.gen_lagH_trans,
-                        a2.gen_lagH_totals,
-                        [(pool, se) for se in hist[h_span - 1]],
-                        pool_prior,
-                    )
-                )
+                gen_comps.append(p_gen_lagH)
+            else:
+                p_gen_lagH = None
             p_gen_raw = a2._combine_probs(pool_prior, gen_comps)
             p_gen = [0.85 * a + 0.15 * min(1.0, b) for a, b in zip(p_gen_raw, pema)]
+
+            # Hierarchical loop-aware retention score: shrink stage-specific transition
+            # toward pooled lag-1 / lag-H transition instead of bare stage_prior.
+            hier_comps = []
+            if prev_stage_ids is not None:
+                tok_prior = p_gen_lagH if p_gen_lagH is not None else stage_prior
+                hier_comps.append(
+                    a2._trans_prob(
+                        a2.prev_tok_trans,
+                        a2.prev_tok_totals,
+                        [(pool, next_loop, se) for se in prev_stage_ids],
+                        tok_prior,
+                    )
+                )
+            elif p_gen_lagH is not None:
+                hier_comps.append(p_gen_lagH)
+            if not boundary and loop is not None and next_loop is not None:
+                hier_comps.append(
+                    a2._trans_prob(
+                        a2.prev_loop_trans,
+                        a2.prev_loop_totals,
+                        [(pool, loop, next_loop, se) for se in tgt_ids],
+                        p_gen_lag1,
+                    )
+                )
+            else:
+                hier_comps.append(p_gen_lag1)
+            p_hier_raw = a2._combine_probs(stage_prior, hier_comps)
+            p_loop_hier = [0.85 * a + 0.15 * min(1.0, b) for a, b in zip(p_hier_raw, pema)]
+
+            # Remaining-loop multi-visit utility: add expected hits across subsequent loops
+            # within the current token (decayed by hop distance) on top of next-visit prob.
+            rem_loops = (
+                sum(1 for pos in pool_positions[pool] if pos > v_idx)
+                if not boundary
+                else 0
+            )
+            if rem_loops > 0:
+                # Discounted multi-visit expected hits: next visit + discounted future loops in same token
+                rem_bonus = 0.35 * (1.0 - 0.65**rem_loops) / 0.35
+                p_loop_rem = [
+                    p_loop_hier[e] + rem_bonus * (0.5 * stage_prior[e] + 0.5 * p_gen_lag1[e])
+                    for e in range(num_experts)
+                ]
+            else:
+                p_loop_rem = list(p_loop_hier)
 
             demands = tuple(sorted(zip(tgt_ids, tgt_weights), key=lambda kv: kv[0]))
             events.append(
@@ -197,6 +247,8 @@ def _prepare_request_events(
                     "demands": demands,
                     "ema": list(pema),
                     "p_loop": p_loop,
+                    "p_loop_hier": p_loop_hier,
+                    "p_loop_rem": p_loop_rem,
                     "p_gen": p_gen,
                     "p_shuf": p_shuf,
                 }
@@ -328,8 +380,12 @@ def simulate_policy(
         demands = ev["demands"]
 
         # Update pool priority with causally observed post-router signals
-        if policy in ("loop_a2", "loop_a2_distance", "pin_recurrent_loop"):
+        if policy in ("loop_a2", "loop_a2_distance"):
             priority[pool] = ev["p_loop"]
+        elif policy in ("loop_hier_distance", "pin_recurrent_loop"):
+            priority[pool] = ev["p_loop_hier"]
+        elif policy == "loop_rem_distance":
+            priority[pool] = ev["p_loop_rem"]
         elif policy in ("general_history", "general_history_distance"):
             priority[pool] = ev["p_gen"]
         elif policy == "loop_shuffled_distance":
@@ -427,6 +483,128 @@ def _bootstrap_ci(values: list[float], n_boot: int = 1000, seed: int = 20261121)
     return means[max(0, int(0.025 * n_boot))], means[min(n_boot - 1, int(0.975 * n_boot))]
 
 
+def _eval_one_request(task: tuple) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    (
+        req,
+        meta,
+        sched,
+        a2,
+        budgets_experts,
+        hot_rank,
+        recurrent_hot_rank,
+        nonrec_hot_rank,
+        a3_cfg,
+        size,
+        total_experts,
+        non_expert_gib,
+        kv_kib_per_tok,
+    ) = task
+    events = _prepare_request_events(req, meta, sched, a2)
+    n_decode = len(req["steps"])
+    seq_len = int(req.get("prompt_len", 0)) + n_decode
+    est_kv_gib = seq_len * kv_kib_per_tok / (1024.0 * 1024.0)
+
+    req_rows: list[dict[str, Any]] = []
+    paired_rows: list[dict[str, Any]] = []
+
+    for cap in budgets_experts:
+        budget_bytes = cap * size
+        budget_gib = budget_bytes / (1024**3)
+        est_total_vram_gib = budget_gib + non_expert_gib + est_kv_gib
+
+        outcomes: dict[str, SimOutcome] = {}
+        for policy in POLICIES:
+            out = simulate_policy(
+                meta,
+                sched,
+                events,
+                policy,
+                cap,
+                hot_rank=hot_rank,
+                recurrent_hot_rank=recurrent_hot_rank,
+                nonrec_hot_rank=nonrec_hot_rank,
+                cfg=a3_cfg,
+            )
+            if out.peak_bytes > budget_bytes:
+                raise AssertionError(
+                    f"Peak budget violation: {policy} cap={cap} peak={out.peak_bytes} > {budget_bytes}"
+                )
+            outcomes[policy] = out
+
+        belady_misses = outcomes["belady"].misses
+        for policy, out in outcomes.items():
+            if out.misses < belady_misses:
+                raise AssertionError(
+                    f"Online policy {policy} beat exact Belady ({out.misses} < {belady_misses})"
+                )
+            h2d = out.misses * size
+            req_rows.append(
+                {
+                    "model": meta["model"],
+                    "budget_experts": cap,
+                    "budget_gib": round(budget_gib, 4),
+                    "budget_percent": round(100.0 * cap / total_experts, 2),
+                    "est_total_vram_gib": round(est_total_vram_gib, 3),
+                    "policy": policy,
+                    "request_id": req["request_id"],
+                    "category": req["category"],
+                    "decode_tokens": n_decode,
+                    "accesses": out.accesses,
+                    "misses": out.misses,
+                    "reloads": out.reloads,
+                    "h2d_bytes": h2d,
+                    "h2d_mib_per_token": (h2d / (1024**2)) / n_decode if n_decode else 0.0,
+                    "hit_rate_by_bytes": 1.0 - out.misses / out.accesses if out.accesses else 0.0,
+                    "peak_weight_bytes": out.peak_bytes,
+                }
+            )
+
+        compare_baselines = (
+            "lru",
+            "static_hot",
+            "oled_adaptive",
+            "general_history_distance",
+            "pin_recurrent_lru",
+            "pin_recurrent_static_hot",
+        )
+        for cand_pol in (
+            "loop_a2",
+            "loop_a2_distance",
+            "loop_hier_distance",
+            "loop_rem_distance",
+            "pin_recurrent_loop",
+            "pin_recurrent_lru",
+            "general_history_distance",
+        ):
+            cand_out = outcomes[cand_pol]
+            for base_pol in compare_baselines:
+                if cand_pol == base_pol:
+                    continue
+                base_out = outcomes[base_pol]
+                gain = sum(a > b for a, b in zip(cand_out.hit_bits, base_out.hit_bits)) * size
+                loss = sum(a < b for a, b in zip(cand_out.hit_bits, base_out.hit_bits)) * size
+                net = gain - loss
+                expected_net = (base_out.misses - cand_out.misses) * size
+                if net != expected_net:
+                    raise AssertionError(f"Gained-lost mismatch: {net} != {expected_net}")
+                paired_rows.append(
+                    {
+                        "budget_experts": cap,
+                        "budget_gib": round(budget_gib, 4),
+                        "policy": cand_pol,
+                        "baseline": base_pol,
+                        "request_id": req["request_id"],
+                        "decode_tokens": n_decode,
+                        "gained_hit_bytes": gain,
+                        "lost_hit_bytes": loss,
+                        "net_saved_h2d_bytes": net,
+                        "saved_h2d_fraction": net / (base_out.misses * size) if base_out.misses else 0.0,
+                        "delta_h2d_mib_per_token": -(net / (1024**2)) / n_decode if n_decode else 0.0,
+                    }
+                )
+    return req_rows, paired_rows
+
+
 def run_a3(
     trace_path: Path,
     manifest: dict[str, Any],
@@ -447,7 +625,6 @@ def run_a3(
     a2 = A2Models(meta, sched, a2_cfg)
     a2.fit(fit_reqs, int(a2_cfg["shuffle_seed"]))
 
-    # Fit-only expert frequency rankings (global, recurrent-only, non-recurrent-only)
     fit_freq: Counter = Counter()
     order = sched["order"]
     for req in fit_reqs:
@@ -471,104 +648,37 @@ def run_a3(
     non_expert_gib = float(a3_cfg.get("non_expert_gib", 1.75))
     kv_kib_per_tok = float(a3_cfg.get("kv_kib_per_token", 168.0))
 
+    tasks = [
+        (
+            req,
+            meta,
+            sched,
+            a2,
+            budgets_experts,
+            hot_rank,
+            recurrent_hot_rank,
+            nonrec_hot_rank,
+            a3_cfg,
+            size,
+            total_experts,
+            non_expert_gib,
+            kv_kib_per_tok,
+        )
+        for req in eval_reqs
+    ]
     req_rows: list[dict[str, Any]] = []
     paired_rows: list[dict[str, Any]] = []
-
-    for req in eval_reqs:
-        events = _prepare_request_events(req, meta, sched, a2)
-        n_decode = len(req["steps"])
-        seq_len = int(req.get("prompt_len", 0)) + n_decode
-        est_kv_gib = seq_len * kv_kib_per_tok / (1024.0 * 1024.0)
-
-        for cap in budgets_experts:
-            budget_bytes = cap * size
-            budget_gib = budget_bytes / (1024**3)
-            est_total_vram_gib = budget_gib + non_expert_gib + est_kv_gib
-
-            outcomes: dict[str, SimOutcome] = {}
-            for policy in POLICIES:
-                out = simulate_policy(
-                    meta,
-                    sched,
-                    events,
-                    policy,
-                    cap,
-                    hot_rank=hot_rank,
-                    recurrent_hot_rank=recurrent_hot_rank,
-                    nonrec_hot_rank=nonrec_hot_rank,
-                    cfg=a3_cfg,
-                )
-                # Strict invariants
-                if out.peak_bytes > budget_bytes:
-                    raise AssertionError(
-                        f"Peak budget violation: {policy} cap={cap} peak={out.peak_bytes} > {budget_bytes}"
-                    )
-                outcomes[policy] = out
-
-            belady_misses = outcomes["belady"].misses
-            for policy, out in outcomes.items():
-                if out.misses < belady_misses:
-                    raise AssertionError(
-                        f"Online policy {policy} beat exact Belady ({out.misses} < {belady_misses})"
-                    )
-                h2d = out.misses * size
-                req_rows.append(
-                    {
-                        "model": meta["model"],
-                        "budget_experts": cap,
-                        "budget_gib": round(budget_gib, 4),
-                        "budget_percent": round(100.0 * cap / total_experts, 2),
-                        "est_total_vram_gib": round(est_total_vram_gib, 3),
-                        "policy": policy,
-                        "request_id": req["request_id"],
-                        "category": req["category"],
-                        "decode_tokens": n_decode,
-                        "accesses": out.accesses,
-                        "misses": out.misses,
-                        "reloads": out.reloads,
-                        "h2d_bytes": h2d,
-                        "h2d_mib_per_token": (h2d / (1024**2)) / n_decode if n_decode else 0.0,
-                        "hit_rate_by_bytes": 1.0 - out.misses / out.accesses if out.accesses else 0.0,
-                        "peak_weight_bytes": out.peak_bytes,
-                    }
-                )
-
-            # Paired comparisons for key candidate policies against baselines
-            compare_baselines = (
-                "lru",
-                "static_hot",
-                "oled_adaptive",
-                "general_history_distance",
-                "pin_recurrent_lru",
-                "pin_recurrent_static_hot",
-            )
-            for cand_pol in ("loop_a2", "loop_a2_distance", "pin_recurrent_loop", "pin_recurrent_lru", "general_history_distance"):
-                cand_out = outcomes[cand_pol]
-                for base_pol in compare_baselines:
-                    if cand_pol == base_pol:
-                        continue
-                    base_out = outcomes[base_pol]
-                    gain = sum(a > b for a, b in zip(cand_out.hit_bits, base_out.hit_bits)) * size
-                    loss = sum(a < b for a, b in zip(cand_out.hit_bits, base_out.hit_bits)) * size
-                    net = gain - loss
-                    expected_net = (base_out.misses - cand_out.misses) * size
-                    if net != expected_net:
-                        raise AssertionError(f"Gained-lost mismatch: {net} != {expected_net}")
-                    paired_rows.append(
-                        {
-                            "budget_experts": cap,
-                            "budget_gib": round(budget_gib, 4),
-                            "policy": cand_pol,
-                            "baseline": base_pol,
-                            "request_id": req["request_id"],
-                            "decode_tokens": n_decode,
-                            "gained_hit_bytes": gain,
-                            "lost_hit_bytes": loss,
-                            "net_saved_h2d_bytes": net,
-                            "saved_h2d_fraction": net / (base_out.misses * size) if base_out.misses else 0.0,
-                            "delta_h2d_mib_per_token": -(net / (1024**2)) / n_decode if n_decode else 0.0,
-                        }
-                    )
+    n_workers = min(8, os.cpu_count() or 1, len(tasks))
+    if n_workers >= 2 and len(tasks) >= 8:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool_exec:
+            for r_rows, p_rows in pool_exec.map(_eval_one_request, tasks):
+                req_rows.extend(r_rows)
+                paired_rows.extend(p_rows)
+    else:
+        for task in tasks:
+            r_rows, p_rows = _eval_one_request(task)
+            req_rows.extend(r_rows)
+            paired_rows.extend(p_rows)
 
     # Aggregate summary per (budget, policy)
     agg: dict[tuple[int, str], Counter] = defaultdict(Counter)
@@ -591,7 +701,9 @@ def run_a3(
         strongest_h2d = agg[cap, strongest_online]["h2d_bytes"]
         # Strongest non-loop online baseline (excluding loop_a2* and pin_recurrent_loop)
         non_loop_baselines = [
-            p for p in ONLINE_POLICIES if p not in ("loop_a2", "loop_a2_distance", "pin_recurrent_loop")
+            p
+            for p in ONLINE_POLICIES
+            if p not in ("loop_a2", "loop_a2_distance", "loop_hier_distance", "loop_rem_distance", "pin_recurrent_loop")
         ]
         strongest_non_loop = min(non_loop_baselines, key=lambda p: (agg[cap, p]["h2d_bytes"], p))
         strongest_non_loop_h2d = agg[cap, strongest_non_loop]["h2d_bytes"]
@@ -683,10 +795,15 @@ def run_a3(
                 "pin_recurrent_lru_hit_rate": sidx[cap, "pin_recurrent_lru"]["hit_rate_by_bytes"],
                 "general_history_distance_hit_rate": sidx[cap, "general_history_distance"]["hit_rate_by_bytes"],
                 "loop_a2_distance_hit_rate": sidx[cap, "loop_a2_distance"]["hit_rate_by_bytes"],
+                "loop_hier_distance_hit_rate": sidx[cap, "loop_hier_distance"]["hit_rate_by_bytes"],
+                "loop_rem_distance_hit_rate": sidx[cap, "loop_rem_distance"]["hit_rate_by_bytes"],
                 "pin_recurrent_loop_hit_rate": sidx[cap, "pin_recurrent_loop"]["hit_rate_by_bytes"],
                 "belady_hit_rate": sidx[cap, "belady"]["hit_rate_by_bytes"],
-                "strongest_non_loop_baseline": sidx[cap, "loop_a2_distance"]["strongest_non_loop_baseline"],
-                "loop_saved_h2d_pct_vs_strongest_non_loop": sidx[cap, "loop_a2_distance"][
+                "strongest_non_loop_baseline": sidx[cap, "loop_hier_distance"]["strongest_non_loop_baseline"],
+                "loop_saved_h2d_pct_vs_strongest_non_loop": sidx[cap, "loop_hier_distance"][
+                    "saved_h2d_pct_vs_strongest_non_loop"
+                ],
+                "loop_rem_saved_h2d_pct_vs_strongest_non_loop": sidx[cap, "loop_rem_distance"][
                     "saved_h2d_pct_vs_strongest_non_loop"
                 ],
                 "pin_loop_saved_h2d_pct_vs_strongest_non_loop": sidx[cap, "pin_recurrent_loop"][

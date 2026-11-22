@@ -229,7 +229,9 @@ class A2Models:
                         row[te] += 1
                     self.shuf_loop_totals[pool, src_loop, tgt_loop, se] += 1
 
-        # Cap table sizes uniformly for fairness (same max_cells budget)
+        # Cap table sizes uniformly for fairness (same max_cells budget) and freeze to plain dicts for pickling
+        self.stage_counts = dict(self.stage_counts)
+        self.pool_counts = dict(self.pool_counts)
         for table_attr, tot_attr in (
             ("prev_tok_trans", "prev_tok_totals"),
             ("prev_loop_trans", "prev_loop_totals"),
@@ -244,19 +246,21 @@ class A2Models:
             if len(table) > self.max_cells:
                 keep = {k for k, _ in totals.most_common(self.max_cells)}
                 setattr(self, table_attr, {k: v for k, v in table.items() if k in keep})
+            else:
+                setattr(self, table_attr, dict(table))
 
     def _stage_prior(self, pool: str, loop: int | None) -> list[float]:
         tot = self.stage_totals[pool, loop]
-        if not tot:
+        cnts = self.stage_counts.get((pool, loop))
+        if not tot or cnts is None:
             return [self.uniform] * self.num_experts
-        cnts = self.stage_counts[pool, loop]
         return [(c + self.shrink * self.uniform) / (tot + self.shrink) for c in cnts]
 
     def _pool_prior(self, pool: str) -> list[float]:
         tot = self.pool_totals[pool]
-        if not tot:
+        cnts = self.pool_counts.get(pool)
+        if not tot or cnts is None:
             return [self.uniform] * self.num_experts
-        cnts = self.pool_counts[pool]
         return [(c + self.shrink * self.uniform) / (tot + self.shrink) for c in cnts]
 
     def _trans_prob(

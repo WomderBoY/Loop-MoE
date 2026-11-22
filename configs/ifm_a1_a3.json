@@ -1,6 +1,6 @@
 {
   "experiment": "ifm_part1_a1_a3",
-  "mode": "smoke",
+  "mode": "formal",
   "xllm_loop_repo": "https://github.com/ifm-ai/xllm-loop.git",
   "xllm_loop_commit": "755c7b3a91081fe0f83500eabd53bd2490b8b745",
   "models": [
@@ -35,8 +35,8 @@
       "bytes_per_expert": 22413312
     }
   },
-  "prompts_file": "configs/ifm_prompts_smoke.jsonl",
-  "fixed_prompts_file": "configs/ifm_fixed_smoke.jsonl",
+  "prompts_file": "configs/ifm_prompts_formal.jsonl",
+  "fixed_prompts_file": "configs/ifm_fixed_formal.jsonl",
   "max_new_tokens": 128,
   "max_prompt_len": 1024,
   "fixed_continuation_tokens": 128,

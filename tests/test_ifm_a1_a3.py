@@ -203,13 +203,16 @@ class TestIFMA1A3(unittest.TestCase):
                 m_dir.mkdir(parents=True)
                 for mode in ("freegen", "fixed"):
                     trace = m_dir / f"trace_{mode}.jsonl.gz"
-                    manifest = _make_synthetic_ifm_trace(trace, arch=arch, n_requests=6, n_steps=6)
+                    n_req = 12 if mode == "freegen" else 6  # >=8 eval reqs exercises ProcessPoolExecutor pickling!
+                    manifest = _make_synthetic_ifm_trace(trace, arch=arch, n_requests=n_req, n_steps=5)
                     h2 = run_a2(trace, manifest, a2_cfg, m_dir / f"a2_{mode}")
                     self.assertEqual(h2["suff_cond_violations"], 0)
                     self.assertGreater(h2["suff_cond_total"], 0)
                     h3 = run_a3(trace, manifest, a2_cfg, a3_cfg, m_dir / f"a3_{mode}")
                     self.assertIn("302", h3["focus"])
-                    self.assertGreaterEqual(h3["focus"]["302"]["belady_hit_rate"], h3["focus"]["302"]["loop_a2_distance_hit_rate"])
+                    self.assertIn("loop_hier_distance_hit_rate", h3["focus"]["302"])
+                    self.assertIn("loop_rem_distance_hit_rate", h3["focus"]["302"])
+                    self.assertGreaterEqual(h3["focus"]["302"]["belady_hit_rate"], h3["focus"]["302"]["loop_hier_distance_hit_rate"])
                 (m_dir / "a1_quality_summary.json").write_text(
                     json.dumps(
                         {

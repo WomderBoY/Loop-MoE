@@ -142,8 +142,8 @@ def generate_report(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             "",
             "### A3 同预算驻留回放（Peak 预算口径，自由生成）",
             "",
-            "| 预算 (GiB / 专家) | LRU | Static Hot | OLED Adap | Pin-Rec LRU | Gen+Dist | Loop+Dist | Pin-Rec+Loop | Belady |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| 预算 (GiB / 专家) | LRU | Static Hot | OLED Adap | Pin-Rec LRU | Gen+Dist | Loop+Dist | Loop-Hier+Dist | Loop-Rem+Dist | Pin-Rec+Loop | Belady |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         a3_rows = {(int(r["budget_experts"]), r["policy"]): r for r in _read_csv(m_dir / "a3_freegen" / "a3_summary.csv")}
         for cap in cfg["a3"]["budgets_experts"]:
@@ -151,7 +151,7 @@ def generate_report(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 continue
             gib = float(a3_rows[cap, "belady"]["budget_gib"])
             cols = [
-                _pct(a3_rows[cap, p]["hit_rate_by_bytes"])
+                _pct(a3_rows[cap, p]["hit_rate_by_bytes"]) if (cap, p) in a3_rows else "—"
                 for p in (
                     "lru",
                     "static_hot",
@@ -159,6 +159,8 @@ def generate_report(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                     "pin_recurrent_lru",
                     "general_history_distance",
                     "loop_a2_distance",
+                    "loop_hier_distance",
+                    "loop_rem_distance",
                     "pin_recurrent_loop",
                     "belady",
                 )
@@ -169,8 +171,8 @@ def generate_report(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             "",
             "**A3 固定文本对照关键预算命中率：**",
             "",
-            "| 预算 (GiB / 专家) | Static Hot | Pin-Rec LRU | Gen+Dist | Loop+Dist | Pin-Rec+Loop | Belady |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| 预算 (GiB / 专家) | Static Hot | Pin-Rec LRU | Gen+Dist | Loop-Hier+Dist | Loop-Rem+Dist | Pin-Rec+Loop | Belady |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         a3_fx_rows = {(int(r["budget_experts"]), r["policy"]): r for r in _read_csv(m_dir / "a3_fixed" / "a3_summary.csv")}
         for cap in (191, 287, 302, 383):
@@ -178,12 +180,13 @@ def generate_report(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 continue
             gib = float(a3_fx_rows[cap, "belady"]["budget_gib"])
             cols = [
-                _pct(a3_fx_rows[cap, p]["hit_rate_by_bytes"])
+                _pct(a3_fx_rows[cap, p]["hit_rate_by_bytes"]) if (cap, p) in a3_fx_rows else "—"
                 for p in (
                     "static_hot",
                     "pin_recurrent_lru",
                     "general_history_distance",
-                    "loop_a2_distance",
+                    "loop_hier_distance",
+                    "loop_rem_distance",
                     "pin_recurrent_loop",
                     "belady",
                 )
