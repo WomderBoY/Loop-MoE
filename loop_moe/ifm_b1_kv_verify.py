@@ -39,11 +39,15 @@ class LoopedIncrementalEngine:
         self.arch = model_spec["arch"]
         self.pools, self.order = build_ifm_topology(model, model_spec)
         self.num_visits = len(self.order)
-        self.visit_caches: list[tuple[torch.Tensor, torch.Tensor, int] | None] = [None] * self.num_visits
+        # xllm CausalAttention only creates/updates KV cache when cache is not None:
+        # pass (None, None, 0) on prefill so it returns (cache_k, cache_v, seq_len).
+        self.visit_caches: list[tuple[torch.Tensor | None, torch.Tensor | None, int]] = [
+            (None, None, 0) for _ in range(self.num_visits)
+        ]
         self.cache_len: int = 0
 
     def reset(self) -> None:
-        self.visit_caches = [None] * self.num_visits
+        self.visit_caches = [(None, None, 0) for _ in range(self.num_visits)]
         self.cache_len = 0
 
     def kv_cache_bytes(self) -> int:

@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from .ifm_a1_collect import download_ifm_artifact, select_idle_gpu
 from .ifm_a2_predict import A2Models, _build_schedule_info, read_ifm_trace
 from .ifm_b1_kv_verify import LoopedIncrementalEngine
+from .ifm_b2_offline_replay import load_trace_splits
 from .ifm_prompts import format_ifm_prompt
 from .ifm_runtime import bootstrap_xllm, load_ifm_model
 from .trace import read_json, read_jsonl, write_csv, write_json
@@ -572,8 +573,7 @@ def run_real_gpu_benchmark_for_model(
     # Fit A2 tables strictly on fit_request_ids from formal trace
     meta, trace_reqs = read_ifm_trace(trace_path)
     sched = _build_schedule_info(meta)
-    fit_set = set(meta["splits"]["fit"])
-    eval_set = set(meta["splits"]["eval"])
+    fit_set, _val_set, eval_set = load_trace_splits(trace_path, meta)
     fit_reqs = [r for r in trace_reqs if r["request_id"] in fit_set]
 
     a2 = A2Models(meta, sched, cfg["a2"])

@@ -706,6 +706,23 @@ def _tune_on_val(
     }
 
 
+def load_trace_splits(trace_path: Path, meta: dict[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    """Load (fit, val, eval) request ID sets from adjacent manifest JSON or meta['splits']."""
+    if "splits" in meta:
+        sp = meta["splits"]
+        return set(sp["fit"]), set(sp.get("val", [])), set(sp["eval"])
+    manifest_name = "requests_manifest_fixed.json" if "fixed" in trace_path.name else "requests_manifest_freegen.json"
+    manifest_path = trace_path.parent / manifest_name
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Expected split manifest at {manifest_path} (and no meta['splits'] found)")
+    manifest = read_json(manifest_path)
+    return (
+        set(manifest["fit_request_ids"]),
+        set(manifest.get("val_request_ids", [])),
+        set(manifest["eval_request_ids"]),
+    )
+
+
 def run_b2_offline_replay(
     trace_path: Path,
     out_dir: Path,
@@ -720,9 +737,7 @@ def run_b2_offline_replay(
     meta, requests = read_ifm_trace(trace_path)
     sched = _build_schedule_info(meta)
 
-    fit_set = set(meta["splits"]["fit"])
-    val_set = set(meta["splits"]["val"])
-    eval_set = set(meta["splits"]["eval"])
+    fit_set, val_set, eval_set = load_trace_splits(trace_path, meta)
     fit_reqs = [r for r in requests if r["request_id"] in fit_set]
     val_reqs = [r for r in requests if r["request_id"] in val_set]
     eval_reqs = [r for r in requests if r["request_id"] in eval_set]
