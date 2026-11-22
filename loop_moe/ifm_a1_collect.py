@@ -24,8 +24,8 @@ from . import orx_run as orx
 from .trace import read_json, read_jsonl, write_line
 
 
-def select_idle_gpu(preferred_index: str | None = None) -> dict[str, Any]:
-    """Strictly pick an idle GPU (0 foreign compute processes, <= 32 MiB used)."""
+def list_idle_gpus(preferred_indices: list[str] | None = None, max_gpus: int = 3) -> list[dict[str, Any]]:
+    """Return up to max_gpus strictly idle GPUs (0 foreign processes, <= 32 MiB used)."""
     inv_raw = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,uuid,name,memory.used,memory.total", "--format=csv,noheader,nounits"],
         check=True,
@@ -56,19 +56,26 @@ def select_idle_gpu(preferred_index: str | None = None) -> dict[str, Any]:
                 "busy": (uuid in busy_uuids) or (int(mem_used) > 32),
             }
         )
-    if preferred_index is not None:
-        match = next((g for g in gpus if g["index"] == str(preferred_index)), None)
-        if match is None:
-            raise RuntimeError(f"Requested GPU {preferred_index} not found")
-        if match["busy"]:
-            raise RuntimeError(
-                f"Refusing to use occupied GPU {match['index']} ({match['memory_used_mib']} MiB used)"
-            )
-        return match
+    if preferred_indices:
+        selected = []
+        for pref in preferred_indices:
+            match = next((g for g in gpus if g["index"] == str(pref)), None)
+            if match is None:
+                raise RuntimeError(f"Requested GPU {pref} not found")
+            if match["busy"]:
+                raise RuntimeError(
+                    f"Refusing to use occupied GPU {match['index']} ({match['memory_used_mib']} MiB used)"
+                )
+            selected.append(match)
+        return selected[:max_gpus]
     idle = [g for g in gpus if not g["busy"]]
     if not idle:
         raise RuntimeError("No idle GPU available on this server; refusing to use occupied GPUs.")
-    return idle[0]
+    return idle[:max_gpus]
+
+
+def select_idle_gpu(preferred_index: str | None = None) -> dict[str, Any]:
+    return list_idle_gpus([preferred_index] if preferred_index is not None else None, max_gpus=1)[0]
 
 
 def _artifact_files_complete(target_dir: Path) -> bool:
@@ -556,12 +563,16 @@ def collect_for_model(
 
 
 def main() -> None:
+    import sys
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/ifm_a1_a3.json"))
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--xllm-loop-dir", type=Path, required=True)
     parser.add_argument("--model-root", type=Path, required=True)
-    parser.add_argument("--gpu", type=str, default=None, help="Explicit GPU index; default auto-picks idle GPU")
+    parser.add_argument("--gpu", type=str, default=None, help="Explicit GPU index(es), comma-separated")
+    parser.add_argument("--max-gpus", type=int, default=3, help="Max idle GPUs to use concurrently")
+    parser.add_argument("--worker-gpu-uuid", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--model", action="append", help="Subset of models to run")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--download-only", action="store_true")
@@ -578,17 +589,104 @@ def main() -> None:
             dl_prog.step(idx)
         return
 
-    # Strict GPU safety check BEFORE importing torch/CUDA
-    gpu = select_idle_gpu(args.gpu)
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
+    # Worker subprocess mode: run single assigned model on assigned idle GPU UUID
+    if args.worker_gpu_uuid is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.worker_gpu_uuid
+        assert len(models) == 1
+        summary = collect_for_model(
+            cfg,
+            models[0],
+            xllm_loop_dir=args.xllm_loop_dir,
+            model_root=args.model_root,
+            out_dir=args.out_dir,
+            local_files_only=args.local_files_only,
+            progress_cb=None,
+        )
+        print(f"WORKER_DONE {models[0]}", json.dumps(summary), flush=True)
+        return
+
+    # Strict GPU safety check BEFORE touching CUDA
+    pref_list = [g.strip() for g in args.gpu.split(",") if g.strip()] if args.gpu else None
+    idle_gpus = list_idle_gpus(pref_list, max_gpus=max(1, args.max_gpus))
     print(
-        f"Selected idle GPU {gpu['index']} ({gpu['name']}, {gpu['memory_used_mib']} MiB used, {gpu['uuid']})",
+        "Selected idle GPU(s): "
+        + ", ".join(f"{g['index']} ({g['name']}, {g['memory_used_mib']} MiB, {g['uuid']})" for g in idle_gpus),
         flush=True,
     )
 
     prompts = list(read_jsonl(Path(cfg["prompts_file"])))
     total_reqs = len(models) * len(prompts)
     prog = orx.progress(total=total_reqs, unit="requests")
+
+    # Parallel multi-GPU launch when >= 2 models and >= 2 idle GPUs are available
+    if len(models) >= 2 and len(idle_gpus) >= 2:
+        import re
+        import threading
+
+        done_count = 0
+        done_lock = threading.Lock()
+        errors: list[str] = []
+        step_re = re.compile(r"rep4=([0-9.]+).*\(([0-9.]+) ms/tok\)")
+
+        def _run_worker(model_name: str, gpu: dict[str, Any]) -> None:
+            nonlocal done_count
+            cmd = [
+                sys.executable,
+                "-u",
+                "-m",
+                "loop_moe.ifm_a1_collect",
+                "--config",
+                str(args.config),
+                "--out-dir",
+                str(args.out_dir),
+                "--xllm-loop-dir",
+                str(args.xllm_loop_dir),
+                "--model-root",
+                str(args.model_root),
+                "--model",
+                model_name,
+                "--worker-gpu-uuid",
+                gpu["uuid"],
+            ]
+            if args.local_files_only:
+                cmd.append("--local-files-only")
+            print(f"[dispatcher] Launching {model_name} on idle GPU {gpu['index']} ({gpu['uuid']})", flush=True)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                if f"[{model_name} freegen " in line:
+                    m = step_re.search(line)
+                    with done_lock:
+                        done_count += 1
+                        if m:
+                            prog.step(done_count, rep4_rate=float(m.group(1)), ms_per_step=float(m.group(2)))
+                        else:
+                            prog.step(done_count)
+            rc = proc.wait()
+            if rc != 0:
+                with done_lock:
+                    errors.append(f"{model_name} on GPU {gpu['index']} exited with code {rc}")
+
+        threads = [
+            threading.Thread(target=_run_worker, args=(name, idle_gpus[i % len(idle_gpus)]))
+            for i, name in enumerate(models)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        summaries = {
+            name: read_json(args.out_dir / name / "a1_quality_summary.json") for name in models
+        }
+        (args.out_dir / "a1_all_summaries.json").write_text(json.dumps(summaries, indent=2) + "\n", encoding="utf-8")
+        print("A1_COMPLETE", json.dumps(summaries, indent=2), flush=True)
+        return
+
+    # Single-GPU fallback
+    os.environ["CUDA_VISIBLE_DEVICES"] = idle_gpus[0]["uuid"]
     done_count = 0
 
     def _cb(model_name: str, _idx: int, _n: int, q: dict[str, Any]) -> None:

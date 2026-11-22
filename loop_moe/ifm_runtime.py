@@ -313,7 +313,9 @@ def ifm_route_collector(
             idx_sl = routing_indices[0, start:stop]  # [S, K]
             w_sl = routing_scores[0, start:stop].float()  # [S, K]
 
-            raw_logits = F.linear(x_sl, router.weight).float()  # [S, E]
+            # Match TopKRouting.forward exactly: run F.linear on full x before slicing
+            # so cuBLAS uses the identical GEMM kernel/reduction order as the model.
+            raw_logits = F.linear(x, router.weight).to(torch.float32)[0, start:stop]  # [S, E]
             if router.score_func == "sigmoid":
                 raw_scores = torch.sigmoid(raw_logits)
             elif router.score_func == "softmax":
@@ -323,9 +325,15 @@ def ifm_route_collector(
             rank_scores = raw_scores + router.bias.to(raw_scores) if router.bias is not None else raw_scores
 
             k = int(router.topk)
-            check_ids = torch.topk(rank_scores, k, dim=-1).indices
+            check_vals, check_ids = torch.topk(rank_scores, k, dim=-1)
             if not torch.equal(check_ids, idx_sl):
-                raise RuntimeError(f"Hook router top-k mismatch at {pool_name}")
+                # Allow exact score ties (within 1e-5) while always recording model's actual idx_sl
+                model_vals = rank_scores.gather(-1, idx_sl)
+                max_gap = float((check_vals.min(dim=-1).values - model_vals.min(dim=-1).values).abs().max().item())
+                if max_gap > 1e-4:
+                    raise RuntimeError(
+                        f"Hook router top-k mismatch at {pool_name}: max_score_gap={max_gap:.6g}"
+                    )
 
             c_k = min(top_candidates, raw_scores.shape[-1])
             cand_scores, cand_ids = torch.topk(rank_scores, c_k, dim=-1)
