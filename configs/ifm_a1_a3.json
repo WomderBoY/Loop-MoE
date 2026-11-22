@@ -1,5 +1,6 @@
 {
-  "experiment": "ifm_part1_a1_a3",
+  "experiment": "ifm_part1_b1_b2",
+  "stage": "b1_b2",
   "mode": "formal",
   "xllm_loop_repo": "https://github.com/ifm-ai/xllm-loop.git",
   "xllm_loop_commit": "755c7b3a91081fe0f83500eabd53bd2490b8b745",
@@ -65,5 +66,16 @@
     "non_expert_gib": 1.75,
     "kv_kib_per_token": 168.0,
     "bootstrap_samples": 1000
+  },
+  "b2_offline": {
+    "budgets_experts": [95, 191, 287, 302, 383, 479]
+  },
+  "stage_b": {
+    "trace_dir": "/data1/shared/wangbangyuan/loop-moe-runs/adf9d9e0-056f-4139-8792-5eba2a4a035c",
+    "b1_prompts": 6,
+    "b1_decode_steps": 32,
+    "gpu_budgets_experts": [191, 302],
+    "gpu_eval_prompts": 18,
+    "gpu_decode_tokens": 48
   }
 }

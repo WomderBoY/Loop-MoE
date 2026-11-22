@@ -44,24 +44,44 @@ report '{"phase":"download","step":0,"of":2,"unit":"models"}'
 bash scripts/download_ifm_models.sh
 report '{"step":2}'
 
-report '{"phase":"a1_collect"}'
+STAGE="$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1])).get('stage','a1_a3'))" "$CONFIG_PATH")"
+echo "[run] STAGE=$STAGE"
+
 GPU_ARGS=()
 if [[ -n "${IFM_GPU_INDEX:-}" ]]; then
   GPU_ARGS=(--gpu "$IFM_GPU_INDEX")
 fi
-PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_a1_collect \
-  --config "$CONFIG_PATH" \
-  --out-dir "$OUT_DIR" \
-  --xllm-loop-dir "$XLLM_LOOP_DIR" \
-  --model-root "$IFM_MODEL_DIR" \
-  --local-files-only \
-  "${GPU_ARGS[@]}"
 
-PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_report \
-  --config "$CONFIG_PATH" \
-  --out-dir "$OUT_DIR"
+if [[ "$STAGE" == "b1_b2" ]]; then
+  TRACE_DIR="${IFM_TRACE_DIR:-$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['stage_b']['trace_dir'])" "$CONFIG_PATH")}"
+  echo "[run] TRACE_DIR=$TRACE_DIR"
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_b_driver \
+    --config "$CONFIG_PATH" \
+    --out-dir "$OUT_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --model-root "$IFM_MODEL_DIR" \
+    --trace-dir "$TRACE_DIR" \
+    "${GPU_ARGS[@]}"
 
-echo "========== REPORT ($OUT_DIR/report_a1_a3.md) =========="
-cat "$OUT_DIR/report_a1_a3.md"
-echo "========== END REPORT =========="
+  echo "========== REPORT ($OUT_DIR/report_b1_b2.md) =========="
+  cat "$OUT_DIR/report_b1_b2.md"
+  echo "========== END REPORT =========="
+else
+  report '{"phase":"a1_collect"}'
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_a1_collect \
+    --config "$CONFIG_PATH" \
+    --out-dir "$OUT_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --model-root "$IFM_MODEL_DIR" \
+    --local-files-only \
+    "${GPU_ARGS[@]}"
+
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_report \
+    --config "$CONFIG_PATH" \
+    --out-dir "$OUT_DIR"
+
+  echo "========== REPORT ($OUT_DIR/report_a1_a3.md) =========="
+  cat "$OUT_DIR/report_a1_a3.md"
+  echo "========== END REPORT =========="
+fi
 echo "OUT_DIR=$OUT_DIR"

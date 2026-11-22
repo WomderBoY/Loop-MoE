@@ -146,13 +146,23 @@ def _sdpa_flash_attention(
     vt = v.transpose(1, 2)
     n_heads = qt.shape[1]
     n_kv = kt.shape[1]
+    l_q = qt.shape[2]
+    l_k = kt.shape[2]
+    attn_mask = None
+    is_causal = use_causal_mask
+    if use_causal_mask and l_q != l_k:
+        # FlashAttention aligns causal masks to the bottom-right corner; PyTorch SDPA's
+        # is_causal=True aligns to top-left. Handle incremental KV-cache decoding explicitly.
+        is_causal = False
+        if l_q > 1:
+            attn_mask = torch.ones((l_q, l_k), dtype=torch.bool, device=qt.device).tril(diagonal=l_k - l_q)
     out = F.scaled_dot_product_attention(
         qt,
         kt,
         vt,
-        attn_mask=None,
+        attn_mask=attn_mask,
         dropout_p=0.0,
-        is_causal=use_causal_mask,
+        is_causal=is_causal,
         scale=scale,
         enable_gqa=(n_heads != n_kv),
     )
