@@ -614,7 +614,7 @@ def run_real_gpu_benchmark_for_model(
     engine = LoopedIncrementalEngine(model, model_spec)
 
     encoded_prompts = [
-        (p, tokenizer.encode(format_ifm_prompt(p), bos=True, eos=False)[-512:])
+        (p, tokenizer.encode(format_ifm_prompt(p)[0], bos=True, eos=False)[-512:])
         for p in eval_prompts
     ]
 

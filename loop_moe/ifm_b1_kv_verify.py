@@ -239,7 +239,7 @@ def verify_model_b1(
     kv_bytes_at_end: list[int] = []
 
     for p_idx, rec in enumerate(prompts):
-        formatted = format_ifm_prompt(rec)
+        formatted, _stops = format_ifm_prompt(rec)
         prompt_ids = tokenizer.encode(formatted, bos=True, eos=False)[-512:]
         if not prompt_ids:
             continue
