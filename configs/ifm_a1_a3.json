@@ -1,6 +1,6 @@
 {
-  "experiment": "ifm_part1_b1_b2",
-  "stage": "b1_b2",
+  "experiment": "ifm_part1_b2_gpu_fast",
+  "stage": "b2_gpu_fast",
   "mode": "formal",
   "xllm_loop_repo": "https://github.com/ifm-ai/xllm-loop.git",
   "xllm_loop_commit": "755c7b3a91081fe0f83500eabd53bd2490b8b745",
@@ -77,5 +77,14 @@
     "gpu_budgets_experts": [191, 302],
     "gpu_eval_prompts": 18,
     "gpu_decode_tokens": 48
+  },
+  "stage_b2_fast": {
+    "trace_dir": "/data1/shared/wangbangyuan/loop-moe-runs/adf9d9e0-056f-4139-8792-5eba2a4a035c",
+    "gpu_budgets_experts": [95, 191, 302],
+    "gpu_eval_prompts": 12,
+    "gpu_decode_tokens": 48,
+    "gamma": 0.75,
+    "freq_weight": 0.15,
+    "prefetch_thresh": 0.25
   }
 }

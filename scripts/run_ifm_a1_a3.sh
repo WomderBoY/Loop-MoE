@@ -52,7 +52,21 @@ if [[ -n "${IFM_GPU_INDEX:-}" ]]; then
   GPU_ARGS=(--gpu "$IFM_GPU_INDEX")
 fi
 
-if [[ "$STAGE" == "b1_b2" ]]; then
+if [[ "$STAGE" == "b2_gpu_fast" ]]; then
+  TRACE_DIR="${IFM_TRACE_DIR:-$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['stage_b2_fast']['trace_dir'])" "$CONFIG_PATH")}"
+  echo "[run] TRACE_DIR=$TRACE_DIR"
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_b2_gpu_fast \
+    --config "$CONFIG_PATH" \
+    --out-dir "$OUT_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --model-root "$IFM_MODEL_DIR" \
+    --trace-dir "$TRACE_DIR" \
+    "${GPU_ARGS[@]}"
+
+  echo "========== REPORT ($OUT_DIR/report_b2_fast.md) =========="
+  cat "$OUT_DIR/report_b2_fast.md"
+  echo "========== END REPORT =========="
+elif [[ "$STAGE" == "b1_b2" ]]; then
   TRACE_DIR="${IFM_TRACE_DIR:-$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['stage_b']['trace_dir'])" "$CONFIG_PATH")}"
   echo "[run] TRACE_DIR=$TRACE_DIR"
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_moe.ifm_b_driver \
