@@ -14,7 +14,7 @@ from typing import Any
 import torch
 
 from . import orx_run as orx
-from .ifm_a1_collect import _model_dir, select_idle_gpu
+from .ifm_a1_collect import download_ifm_artifact, select_idle_gpu
 from .ifm_b1_kv_verify import verify_model_b1
 from .ifm_b2_gpu_bench import run_real_gpu_benchmark_for_model
 from .ifm_b2_microbench import benchmark_pcie_and_ffn
@@ -156,7 +156,7 @@ def main() -> None:
     b1_rows: list[dict[str, Any]] = []
     for idx, model_name in enumerate(cfg["models"], start=1):
         spec = cfg["checkpoints"][model_name]
-        mdir = _model_dir(Path(args.model_root), spec["repo"])
+        mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
         summary, rows = verify_model_b1(
             model_name,
             spec,
@@ -274,7 +274,7 @@ def main() -> None:
     for idx, model_name in enumerate(cfg["models"], start=1):
         _assert_no_foreign_gpu_procs(gpu["uuid"], gpu["index"])
         spec = cfg["checkpoints"][model_name]
-        mdir = _model_dir(Path(args.model_root), spec["repo"])
+        mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
         trace_path = trace_root / model_name / "trace_freegen.jsonl.gz"
         srows, rrows = run_real_gpu_benchmark_for_model(
             model_name,

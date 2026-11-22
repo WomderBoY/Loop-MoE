@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .ifm_a1_collect import _model_dir, select_idle_gpu
+from .ifm_a1_collect import download_ifm_artifact, select_idle_gpu
 from .ifm_a2_predict import A2Models, _build_schedule_info, read_ifm_trace
 from .ifm_b1_kv_verify import LoopedIncrementalEngine
 from .ifm_prompts import format_ifm_prompt

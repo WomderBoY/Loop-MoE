@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import torch
 
-from .ifm_a1_collect import _model_dir, select_idle_gpu
+from .ifm_a1_collect import download_ifm_artifact, select_idle_gpu
 from .ifm_prompts import format_ifm_prompt
 from .ifm_runtime import bootstrap_xllm, build_ifm_topology, load_ifm_model
 from .trace import read_json, read_jsonl, write_csv, write_json
@@ -448,7 +448,7 @@ def main() -> None:
     all_rows: list[dict[str, Any]] = []
     for model_name in cfg["models"]:
         spec = cfg["checkpoints"][model_name]
-        mdir = _model_dir(Path(args.model_root), spec["repo"])
+        mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
         summary, rows = verify_model_b1(
             model_name,
             spec,
