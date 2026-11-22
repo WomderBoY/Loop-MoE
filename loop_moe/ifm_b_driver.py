@@ -139,116 +139,131 @@ def main() -> None:
     torch.cuda.set_device(device)
     print(f"[Stage B] Selected strictly idle GPU {gpu['index']} ({gpu['name']}, {gpu['memory_used_mib']} MiB used)")
 
+    orx.plan(
+        [
+            {"phase": "b2_microbench", "of": 1, "unit": "bench"},
+            {"phase": "b1_kv_verify", "of": len(cfg["models"]), "unit": "models"},
+            {"phase": "b2_offline_replay", "of": len(cfg["models"]) * 2, "unit": "regimes"},
+            {"phase": "b2_gpu_bench", "of": len(cfg["models"]), "unit": "models"},
+            {"phase": "report", "of": 1, "unit": "report"},
+        ]
+    )
+    prog = orx.progress(total=1, unit="bench", phase="b2_microbench")
+
     # 1. Hardware microbenchmark
-    orx.phase("b2_microbench", step=0, of=1, unit="bench")
     micro = benchmark_pcie_and_ffn(device=device)
     micro["gpu_index"] = gpu["index"]
     micro["gpu_uuid"] = gpu["uuid"]
     write_json(out_dir / "b2_microbench.json", micro)
-    orx.emit({"step": 1, "m": {"h2d_conc_ms": micro["h2d_concurrent_p50_ms"], "pcie_bw_gibs": micro["h2d_concurrent_bw_gib_s"]}})
+    prog.step(
+        1,
+        h2d_concurrent_p50_ms=micro["h2d_concurrent_p50_ms"],
+        pcie_bw_conc_gib_s=micro["h2d_concurrent_bw_gib_s"],
+    )
+    prog.flush()
     print(f"[B2 microbench] H2D iso={micro['h2d_isolated_p50_ms']}ms conc={micro['h2d_concurrent_p50_ms']}ms ({micro['h2d_concurrent_bw_gib_s']} GiB/s)")
 
     # 2. B1 Incremental KV-Cache Verification
-    orx.phase("b1_kv_verify", step=0, of=len(cfg["models"]), unit="models")
     all_prompts = list(read_jsonl(Path(cfg["prompts_file"])))
     b1_prompts = all_prompts[: int(b_cfg.get("b1_prompts", 6))]
     b1_summaries: dict[str, Any] = {}
     b1_rows: list[dict[str, Any]] = []
-    for idx, model_name in enumerate(cfg["models"], start=1):
-        spec = cfg["checkpoints"][model_name]
-        mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
-        summary, rows = verify_model_b1(
-            model_name,
-            spec,
-            mdir,
-            b1_prompts,
-            device=device,
-            decode_steps=int(b_cfg.get("b1_decode_steps", 32)),
-            attention_backend=cfg.get("attention_backend", "sdpa"),
-        )
-        b1_summaries[model_name] = summary
-        b1_rows.extend(rows)
-        orx.emit(
-            {
-                "step": idx,
-                "m": {
-                    f"{'ouro' if 'Ouro' in model_name else 'huginn'}_b1_inc_tpot_ms": summary["incremental_tpot_ms"],
-                    f"{'ouro' if 'Ouro' in model_name else 'huginn'}_b1_greedy_match": summary["free_greedy_match_rate"],
+    with prog.phase("b1_kv_verify", total=len(cfg["models"]), unit="models"):
+        for idx, model_name in enumerate(cfg["models"], start=1):
+            spec = cfg["checkpoints"][model_name]
+            mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
+            summary, rows = verify_model_b1(
+                model_name,
+                spec,
+                mdir,
+                b1_prompts,
+                device=device,
+                decode_steps=int(b_cfg.get("b1_decode_steps", 32)),
+                attention_backend=cfg.get("attention_backend", "sdpa"),
+            )
+            b1_summaries[model_name] = summary
+            b1_rows.extend(rows)
+            tag = "ouro" if "Ouro" in model_name else "huginn"
+            prog.step(
+                idx,
+                **{
+                    f"{tag}_b1_inc_tpot_ms": summary["incremental_tpot_ms"],
+                    f"{tag}_b1_greedy_match": summary["free_greedy_match_rate"],
                 },
-            }
-        )
-        print(f"[B1 {model_name}] inc_tpot={summary['incremental_tpot_ms']}ms (vs {summary['full_prefix_tpot_ms']}ms), greedy_match={summary['free_greedy_match_rate']:.4f}, visit_comp={summary['measured_visit_compute_ms']}ms")
+            )
+            prog.flush()
+            print(f"[B1 {model_name}] inc_tpot={summary['incremental_tpot_ms']}ms (vs {summary['full_prefix_tpot_ms']}ms), greedy_match={summary['free_greedy_match_rate']:.4f}, visit_comp={summary['measured_visit_compute_ms']}ms")
     write_json(out_dir / "b1_kv_verification.json", b1_summaries)
     write_csv(out_dir / "b1_kv_steps.csv", b1_rows)
 
     # 3. B2 Offline 96-request CPU co-simulation (calibrated with exact measured timings + batch=8 overlap regime)
     trace_root = Path(args.trace_dir)
     h2d_ms = float(micro["h2d_concurrent_p50_ms"])
-    orx.phase("b2_offline_replay", step=0, of=len(cfg["models"]) * 2, unit="regimes")
     offline_summary: dict[str, dict[str, list[dict[str, Any]]]] = {}
     offline_paired: dict[str, dict[str, list[dict[str, Any]]]] = {}
     tuned_by_model: dict[str, dict[str, Any]] = {}
     step_i = 0
-    for model_name in cfg["models"]:
-        offline_summary[model_name] = {}
-        offline_paired[model_name] = {}
-        trace_path = trace_root / model_name / "trace_freegen.jsonl.gz"
-        visit_comp_b1 = max(0.15, float(b1_summaries[model_name]["measured_visit_compute_ms"]))
-        regimes = [
-            ("measured_b1", h2d_ms, visit_comp_b1),
-            ("batch8_overlap", h2d_ms, max(visit_comp_b1 * 3.0, h2d_ms * 1.15)),
-        ]
-        m_out = out_dir / model_name / "b2_offline"
-        for reg_name, r_h2d, r_comp in regimes:
-            hl = run_b2_offline_replay(
-                trace_path,
-                m_out,
-                cfg,
-                h2d_ms=r_h2d,
-                visit_comp_ms=r_comp,
-                regime_name=reg_name,
-                workers=16,
-            )
-            if reg_name == "measured_b1":
-                tuned_by_model[model_name] = hl["tuned"]
-            offline_summary[model_name][reg_name] = list(
-                csv.DictReader((m_out / f"b2_offline_summary_{reg_name}.csv").open())
-            )
-            # Parse float fields back
-            for row in offline_summary[model_name][reg_name]:
-                for k in (
-                    "budget_gib",
-                    "demand_hit_rate",
-                    "demand_h2d_mib_per_tok",
-                    "prefetch_h2d_mib_per_tok",
-                    "total_h2d_mib_per_tok",
-                    "timely_pf_rate",
-                    "useful_pf_rate",
-                    "wasted_pf_rate",
-                    "exposed_stall_ms_per_tok",
-                    "exposed_stall_p50_ms_per_tok",
-                    "total_ms_per_tok",
-                ):
-                    row[k] = float(row[k])
-            offline_paired[model_name][reg_name] = list(
-                csv.DictReader((m_out / f"b2_offline_paired_{reg_name}.csv").open())
-            )
-            for row in offline_paired[model_name][reg_name]:
-                for k in (
-                    "budget_gib",
-                    "mean_stall_saved_pct",
-                    "stall_ci95_lo_pct",
-                    "stall_ci95_hi_pct",
-                    "mean_demand_h2d_saved_pct",
-                    "h2d_ci95_lo_pct",
-                    "h2d_ci95_hi_pct",
-                ):
-                    row[k] = float(row[k])
-                for k in ("wins_stall", "ties_stall", "losses_stall"):
-                    row[k] = int(row[k])
-            step_i += 1
-            orx.emit({"step": step_i})
-            print(f"[B2 offline {model_name}/{reg_name}] tuned={hl['tuned']}")
+    with prog.phase("b2_offline_replay", total=len(cfg["models"]) * 2, unit="regimes"):
+        for model_name in cfg["models"]:
+            offline_summary[model_name] = {}
+            offline_paired[model_name] = {}
+            trace_path = trace_root / model_name / "trace_freegen.jsonl.gz"
+            visit_comp_b1 = max(0.15, float(b1_summaries[model_name]["measured_visit_compute_ms"]))
+            regimes = [
+                ("measured_b1", h2d_ms, visit_comp_b1),
+                ("batch8_overlap", h2d_ms, max(visit_comp_b1 * 3.0, h2d_ms * 1.15)),
+            ]
+            m_out = out_dir / model_name / "b2_offline"
+            for reg_name, r_h2d, r_comp in regimes:
+                hl = run_b2_offline_replay(
+                    trace_path,
+                    m_out,
+                    cfg,
+                    h2d_ms=r_h2d,
+                    visit_comp_ms=r_comp,
+                    regime_name=reg_name,
+                    workers=16,
+                )
+                if reg_name == "measured_b1":
+                    tuned_by_model[model_name] = hl["tuned"]
+                offline_summary[model_name][reg_name] = list(
+                    csv.DictReader((m_out / f"b2_offline_summary_{reg_name}.csv").open())
+                )
+                for row in offline_summary[model_name][reg_name]:
+                    for k in (
+                        "budget_gib",
+                        "demand_hit_rate",
+                        "demand_h2d_mib_per_tok",
+                        "prefetch_h2d_mib_per_tok",
+                        "total_h2d_mib_per_tok",
+                        "timely_pf_rate",
+                        "useful_pf_rate",
+                        "wasted_pf_rate",
+                        "exposed_stall_ms_per_tok",
+                        "exposed_stall_p50_ms_per_tok",
+                        "total_ms_per_tok",
+                    ):
+                        row[k] = float(row[k])
+                offline_paired[model_name][reg_name] = list(
+                    csv.DictReader((m_out / f"b2_offline_paired_{reg_name}.csv").open())
+                )
+                for row in offline_paired[model_name][reg_name]:
+                    for k in (
+                        "budget_gib",
+                        "mean_stall_saved_pct",
+                        "stall_ci95_lo_pct",
+                        "stall_ci95_hi_pct",
+                        "mean_demand_h2d_saved_pct",
+                        "h2d_ci95_lo_pct",
+                        "h2d_ci95_hi_pct",
+                    ):
+                        row[k] = float(row[k])
+                    for k in ("wins_stall", "ties_stall", "losses_stall"):
+                        row[k] = int(row[k])
+                step_i += 1
+                prog.step(step_i)
+                prog.flush()
+                print(f"[B2 offline {model_name}/{reg_name}] tuned={hl['tuned']}")
 
     # 4. B2 Real GPU Offload & CUDA Copy-Stream 2x2 Benchmark (re-check no FOREIGN process started on our GPU!)
     def _assert_no_foreign_gpu_procs(gpu_uuid: str, gpu_index: str) -> None:
@@ -267,73 +282,73 @@ def main() -> None:
             if u == gpu_uuid and pid != my_pid:
                 raise RuntimeError(f"Foreign process PID={pid} appeared on GPU {gpu_index}; aborting safely.")
 
-    orx.phase("b2_gpu_bench", step=0, of=len(cfg["models"]), unit="models")
     gpu_budgets = [int(b) for b in b_cfg.get("gpu_budgets_experts", [191, 302])]
     gpu_summary_all: list[dict[str, Any]] = []
     gpu_reqs_all: list[dict[str, Any]] = []
-    for idx, model_name in enumerate(cfg["models"], start=1):
-        _assert_no_foreign_gpu_procs(gpu["uuid"], gpu["index"])
-        spec = cfg["checkpoints"][model_name]
-        mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
-        trace_path = trace_root / model_name / "trace_freegen.jsonl.gz"
-        srows, rrows = run_real_gpu_benchmark_for_model(
-            model_name,
-            spec,
-            mdir,
-            trace_path,
-            all_prompts,
-            cfg,
-            device=device,
-            budgets=gpu_budgets,
-            n_eval_prompts=int(b_cfg.get("gpu_eval_prompts", 18)),
-            decode_tokens=int(b_cfg.get("gpu_decode_tokens", 48)),
-            tuned_params=tuned_by_model.get(model_name),
-        )
-        gpu_summary_all.extend(srows)
-        gpu_reqs_all.extend(rrows)
-        orx.emit({"step": idx})
-        print(f"[B2 real GPU {model_name}] done ({len(srows)} budget×policy summaries)")
+    with prog.phase("b2_gpu_bench", total=len(cfg["models"]), unit="models"):
+        for idx, model_name in enumerate(cfg["models"], start=1):
+            _assert_no_foreign_gpu_procs(gpu["uuid"], gpu["index"])
+            spec = cfg["checkpoints"][model_name]
+            mdir = download_ifm_artifact(spec["repo"], Path(args.model_root), local_files_only=True)
+            trace_path = trace_root / model_name / "trace_freegen.jsonl.gz"
+            srows, rrows = run_real_gpu_benchmark_for_model(
+                model_name,
+                spec,
+                mdir,
+                trace_path,
+                all_prompts,
+                cfg,
+                device=device,
+                budgets=gpu_budgets,
+                n_eval_prompts=int(b_cfg.get("gpu_eval_prompts", 18)),
+                decode_tokens=int(b_cfg.get("gpu_decode_tokens", 48)),
+                tuned_params=tuned_by_model.get(model_name),
+            )
+            gpu_summary_all.extend(srows)
+            gpu_reqs_all.extend(rrows)
+            prog.step(idx)
+            prog.flush()
+            print(f"[B2 real GPU {model_name}] done ({len(srows)} budget×policy summaries)")
 
     write_csv(out_dir / "b2_gpu_summary.csv", gpu_summary_all)
     write_csv(out_dir / "b2_gpu_requests.csv", gpu_reqs_all)
 
     # 5. Report & Headline Metrics
-    orx.phase("report", step=0, of=1, unit="report")
-    report_md = _build_b_report(out_dir, micro, b1_summaries, offline_summary, offline_paired, gpu_summary_all)
-    (out_dir / "report_b1_b2.md").write_text(report_md, encoding="utf-8")
+    with prog.phase("report", total=1, unit="report"):
+        report_md = _build_b_report(out_dir, micro, b1_summaries, offline_summary, offline_paired, gpu_summary_all)
+        (out_dir / "report_b1_b2.md").write_text(report_md, encoding="utf-8")
 
-    # Emit compact headline metrics
-    headline: dict[str, Any] = {
-        "h2d_isolated_p50_ms": micro["h2d_isolated_p50_ms"],
-        "h2d_concurrent_p50_ms": micro["h2d_concurrent_p50_ms"],
-        "pcie_bw_conc_gib_s": micro["h2d_concurrent_bw_gib_s"],
-    }
-    for m, s in b1_summaries.items():
-        tag = "ouro" if "Ouro" in m else "huginn"
-        headline[f"{tag}_b1_inc_tpot_ms"] = s["incremental_tpot_ms"]
-        headline[f"{tag}_b1_greedy_match"] = s["free_greedy_match_rate"]
-        headline[f"{tag}_b1_route_match"] = s["decode_route_exact_match_rate"]
-    for m in cfg["models"]:
-        tag = "ouro" if "Ouro" in m else "huginn"
-        p_b1 = {(int(r["budget_experts"]), r["policy"], r["baseline"]): r for r in offline_paired[m]["measured_b1"]}
-        if (302, "loop_hazard_pf", "general_hazard_pf") in p_b1:
-            headline[f"{tag}_off_pf_stall_saved_6p3g_pct"] = round(
-                p_b1[302, "loop_hazard_pf", "general_hazard_pf"]["mean_stall_saved_pct"], 3
-            )
-        if (191, "loop_hazard_pf", "general_hazard_pf") in p_b1:
-            headline[f"{tag}_off_pf_stall_saved_4g_pct"] = round(
-                p_b1[191, "loop_hazard_pf", "general_hazard_pf"]["mean_stall_saved_pct"], 3
-            )
-        # Real GPU TPOT at 4.0 GiB (191) and 6.3 GiB (302)
-        gmap = {(int(r["budget_experts"]), r["policy"]): r for r in gpu_summary_all if r["model"] == m}
-        for cap, btag in ((191, "4g"), (302, "6p3g")):
-            if (cap, "loop_pf") in gmap and (cap, "general_pf") in gmap:
-                headline[f"{tag}_gpu_tpot_{btag}_loop_pf_ms"] = gmap[cap, "loop_pf"]["tpot_mean_ms"]
-                headline[f"{tag}_gpu_tpot_{btag}_gen_pf_ms"] = gmap[cap, "general_pf"]["tpot_mean_ms"]
-                headline[f"{tag}_gpu_tpot_{btag}_gen_nopf_ms"] = gmap[cap, "general_nopf"]["tpot_mean_ms"]
+        headline: dict[str, Any] = {
+            "h2d_isolated_p50_ms": micro["h2d_isolated_p50_ms"],
+            "h2d_concurrent_p50_ms": micro["h2d_concurrent_p50_ms"],
+            "pcie_bw_conc_gib_s": micro["h2d_concurrent_bw_gib_s"],
+        }
+        for m, s in b1_summaries.items():
+            tag = "ouro" if "Ouro" in m else "huginn"
+            headline[f"{tag}_b1_inc_tpot_ms"] = s["incremental_tpot_ms"]
+            headline[f"{tag}_b1_greedy_match"] = s["free_greedy_match_rate"]
+            headline[f"{tag}_b1_route_match"] = s["decode_route_exact_match_rate"]
+        for m in cfg["models"]:
+            tag = "ouro" if "Ouro" in m else "huginn"
+            p_b1 = {(int(r["budget_experts"]), r["policy"], r["baseline"]): r for r in offline_paired[m]["measured_b1"]}
+            if (302, "loop_hazard_pf", "general_hazard_pf") in p_b1:
+                headline[f"{tag}_off_pf_stall_saved_6p3g_pct"] = round(
+                    p_b1[302, "loop_hazard_pf", "general_hazard_pf"]["mean_stall_saved_pct"], 3
+                )
+            if (191, "loop_hazard_pf", "general_hazard_pf") in p_b1:
+                headline[f"{tag}_off_pf_stall_saved_4g_pct"] = round(
+                    p_b1[191, "loop_hazard_pf", "general_hazard_pf"]["mean_stall_saved_pct"], 3
+                )
+            gmap = {(int(r["budget_experts"]), r["policy"]): r for r in gpu_summary_all if r["model"] == m}
+            for cap, btag in ((191, "4g"), (302, "6p3g")):
+                if (cap, "loop_pf") in gmap and (cap, "general_pf") in gmap:
+                    headline[f"{tag}_gpu_tpot_{btag}_loop_pf_ms"] = gmap[cap, "loop_pf"]["tpot_mean_ms"]
+                    headline[f"{tag}_gpu_tpot_{btag}_gen_pf_ms"] = gmap[cap, "general_pf"]["tpot_mean_ms"]
+                    headline[f"{tag}_gpu_tpot_{btag}_gen_nopf_ms"] = gmap[cap, "general_nopf"]["tpot_mean_ms"]
 
-    write_json(out_dir / "headline_metrics_b.json", headline)
-    orx.emit({"step": 1, "m": headline})
+        write_json(out_dir / "headline_metrics_b.json", headline)
+        prog.step(1, **headline)
+        prog.flush()
 
 
 if __name__ == "__main__":
