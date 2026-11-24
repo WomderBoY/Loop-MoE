@@ -66,6 +66,13 @@ elif [[ "$IDEA" == "idea2_expert_unbinding" ]]; then
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "new_dir2_vsubmoe" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.vsubmoe_pilot \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1

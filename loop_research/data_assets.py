@@ -10,7 +10,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
+
+def _read_parquet_rows(path: Path) -> list[dict[str, Any]]:
+    import pyarrow.parquet as pq
+    return pq.read_table(path).to_pylist()
 
 
 DATASET_SPECS: dict[str, tuple[str, list[str]]] = {
@@ -32,11 +35,65 @@ DATASET_SPECS: dict[str, tuple[str, list[str]]] = {
     ),
 }
 
+DYNAMIC_DATASET_REPOS: dict[str, tuple[str, list[str]]] = {
+    "gsm8k": ("openai/gsm8k", ["main/train", "main/test"]),
+    "math500": ("HuggingFaceH4/MATH-500", ["test"]),
+    "arc_challenge": ("allenai/ai2_arc", ["ARC-Challenge/test", "ARC-Challenge/validation"]),
+}
+
 MODEL_REPOS: dict[str, tuple[str, str]] = {
     "ouro14b": ("ByteDance/Ouro-1.4B", "ByteDance__Ouro-1.4B"),
+    "ouro14b_thinking": ("ByteDance/Ouro-1.4B-Thinking", "ByteDance__Ouro-1.4B-Thinking"),
+    "ouro26b_thinking": ("ByteDance/Ouro-2.6B-Thinking", "ByteDance__Ouro-2.6B-Thinking"),
     "ifm_ouro": ("IFM/LoopedLM-P1-moe-ouro-500b", "IFM__LoopedLM-P1-moe-ouro-500b"),
     "ifm_huginn": ("IFM/LoopedLM-P1-moe-huginn-500b", "IFM__LoopedLM-P1-moe-huginn-500b"),
 }
+
+
+def _download_dynamic_dataset(ds_key: str, ds_root: Path) -> str:
+    """Download parquet/jsonl files for a dataset by querying HfApi file listing."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repo_id, patterns = DYNAMIC_DATASET_REPOS[ds_key]
+    ds_target = ds_root / ds_key
+    ds_target.mkdir(parents=True, exist_ok=True)
+
+    existing = list(ds_target.rglob("*.parquet")) + list(ds_target.rglob("*.jsonl"))
+    if existing and all(p.stat().st_size > 0 for p in existing):
+        print(f"[download] Dataset {ds_key} already cached ({len(existing)} files).")
+        return str(ds_target)
+
+    api = HfApi()
+    all_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    chosen: list[str] = []
+    for f in all_files:
+        if not (f.endswith(".parquet") or f.endswith(".jsonl") or f.endswith(".json")):
+            continue
+        if any(pat in f for pat in patterns):
+            chosen.append(f)
+    if not chosen:
+        # Fallback: try refs/convert/parquet
+        try:
+            pq_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision="refs/convert/parquet")
+            for f in pq_files:
+                if f.endswith(".parquet"):
+                    chosen.append(f)
+            revision = "refs/convert/parquet"
+        except Exception as exc:
+            raise RuntimeError(f"Could not locate data files for {repo_id}: {all_files[:20]}") from exc
+    else:
+        revision = "main"
+
+    for rel_file in chosen:
+        print(f"[download] Downloading {repo_id}@{revision}:{rel_file} -> {ds_target}")
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=rel_file,
+            repo_type="dataset",
+            revision=revision,
+            local_dir=str(ds_target),
+        )
+    return str(ds_target)
 
 
 def download_requested_assets(
@@ -44,7 +101,7 @@ def download_requested_assets(
     model_dir: str | Path,
     dataset_dir: str | Path,
 ) -> dict[str, str]:
-    """Download/verify models and parquet datasets via HF mirror (idempotent)."""
+    """Download/verify models and parquet/jsonl datasets via HF mirror (idempotent)."""
     from huggingface_hub import hf_hub_download, snapshot_download
 
     model_root = Path(model_dir)
@@ -92,9 +149,197 @@ def download_requested_assets(
                     if src != out_file and not out_file.exists():
                         out_file.symlink_to(src)
                 resolved[ds_key] = str(ds_target)
+        elif asset in DYNAMIC_DATASET_REPOS:
+            resolved[asset] = _download_dynamic_dataset(asset, ds_root)
         else:
             raise ValueError(f"Unknown asset key: {asset!r}")
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# Math & Multiple-Choice Benchmark Loaders (GSM8K, MATH-500, ARC-Challenge)
+# ---------------------------------------------------------------------------
+
+def extract_gsm8k_gold(answer_text: str) -> str:
+    m = re.search(r"####\s*([^\n]+)", answer_text)
+    raw = m.group(1) if m else answer_text.strip().splitlines()[-1]
+    return normalize_math_answer(raw)
+
+
+def extract_boxed(text: str) -> str | None:
+    """Extract the last \\boxed{...} content with balanced brace handling."""
+    idx = text.rfind("\\boxed{")
+    if idx < 0:
+        return None
+    start = idx + len("\\boxed{")
+    depth = 1
+    pos = start
+    while pos < len(text) and depth > 0:
+        ch = text[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        pos += 1
+    if depth == 0:
+        return text[start : pos - 1].strip()
+    return text[start:].strip()
+
+
+def normalize_math_answer(ans: str) -> str:
+    s = str(ans).strip()
+    s = s.replace(",", "").replace("$", "").replace("\\!", "").replace("\\ ", " ")
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
+    s = re.sub(r"\\left|\\right", "", s)
+    s = s.strip().rstrip(".")
+    # Canonicalize simple numeric strings (e.g., "42.0" -> "42")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", s):
+        try:
+            f = float(s)
+            if abs(f - round(f)) < 1e-9:
+                return str(int(round(f)))
+            return f"{f:.6g}"
+        except ValueError:
+            pass
+    return re.sub(r"\s+", "", s)
+
+
+def extract_predicted_math_answer(text: str, *, mode: str = "gsm8k") -> str:
+    """Extract final predicted math answer from model completion."""
+    boxed = extract_boxed(text)
+    if boxed is not None:
+        return normalize_math_answer(boxed)
+    m = re.search(r"####\s*([-+]?[\d,]+(?:\.\d+)?)", text)
+    if m:
+        return normalize_math_answer(m.group(1))
+    # Search after </think> if present
+    tail = text.split("</think>")[-1] if "</think>" in text else text
+    boxed_tail = extract_boxed(tail)
+    if boxed_tail is not None:
+        return normalize_math_answer(boxed_tail)
+    if mode == "gsm8k":
+        nums = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", tail)
+        if nums:
+            return normalize_math_answer(nums[-1])
+    else:
+        # Look for "answer is ..." or last line
+        m_ans = re.search(r"(?:answer|result)\s*(?:is|=|:)\s*([^\n.]+)", tail, flags=re.IGNORECASE)
+        if m_ans:
+            return normalize_math_answer(m_ans.group(1))
+        nums = re.findall(r"[-+]?\d[\d,]*(?:/\d+|\.\d+)?", tail)
+        if nums:
+            return normalize_math_answer(nums[-1])
+    return ""
+
+
+def load_gsm8k_split(
+    dataset_dir: str | Path,
+    split: str = "test",
+    *,
+    n_samples: int = 100,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    p_dir = Path(dataset_dir) / "gsm8k"
+    cands = sorted(p_dir.rglob(f"*{split}*.parquet"))
+    if not cands:
+        raise FileNotFoundError(f"GSM8K {split} parquet not found under {p_dir}")
+    rows = _read_parquet_rows(cands[0])
+    rng = random.Random(seed)
+    idxs = list(range(len(rows)))
+    rng.shuffle(idxs)
+    out: list[dict[str, Any]] = []
+    for i in idxs[:n_samples]:
+        r = rows[i]
+        out.append(
+            {
+                "id": f"gsm8k_{split}_{i}",
+                "question": str(r["question"]).strip(),
+                "solution": str(r["answer"]).strip(),
+                "gold": extract_gsm8k_gold(str(r["answer"])),
+            }
+        )
+    return out
+
+
+def load_math500_samples(
+    dataset_dir: str | Path,
+    *,
+    n_samples: int = 100,
+    max_level: int = 5,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    p_dir = Path(dataset_dir) / "math500"
+    pq_cands = sorted(p_dir.rglob("*.parquet"))
+    jl_cands = sorted(p_dir.rglob("*.jsonl"))
+    rows: list[dict[str, Any]] = []
+    if pq_cands:
+        rows = _read_parquet_rows(pq_cands[0])
+    elif jl_cands:
+        with open(jl_cands[0], "r", encoding="utf-8") as fp:
+            for line in fp:
+                if line.strip():
+                    rows.append(json.loads(line))
+    else:
+        raise FileNotFoundError(f"MATH-500 data not found under {p_dir}")
+
+    filtered = [r for r in rows if int(r.get("level", 3)) <= max_level]
+    rng = random.Random(seed)
+    idxs = list(range(len(filtered)))
+    rng.shuffle(idxs)
+    out: list[dict[str, Any]] = []
+    for i in idxs[:n_samples]:
+        r = filtered[i]
+        out.append(
+            {
+                "id": str(r.get("unique_id", f"math500_{i}")),
+                "question": str(r["problem"]).strip(),
+                "solution": str(r.get("solution", "")).strip(),
+                "gold": normalize_math_answer(str(r.get("answer", ""))),
+                "level": int(r.get("level", 0)),
+                "subject": str(r.get("subject", "unknown")),
+            }
+        )
+    return out
+
+
+def load_arc_challenge_samples(
+    dataset_dir: str | Path,
+    *,
+    n_samples: int = 200,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    p_dir = Path(dataset_dir) / "arc_challenge"
+    cands = sorted(p_dir.rglob("*test*.parquet"))
+    if not cands:
+        cands = sorted(p_dir.rglob("*.parquet"))
+    if not cands:
+        raise FileNotFoundError(f"ARC-Challenge parquet not found under {p_dir}")
+    rows = _read_parquet_rows(cands[0])
+    rng = random.Random(seed)
+    idxs = list(range(len(rows)))
+    rng.shuffle(idxs)
+    out: list[dict[str, Any]] = []
+    for i in idxs:
+        r = rows[i]
+        choices = r.get("choices", {})
+        labels = list(choices.get("label", []))
+        texts = list(choices.get("text", []))
+        ans_key = str(r.get("answerKey", "")).strip()
+        if ans_key not in labels or len(labels) < 2:
+            continue
+        out.append(
+            {
+                "id": str(r.get("id", f"arc_{i}")),
+                "question": str(r["question"]).strip(),
+                "choice_labels": labels,
+                "choice_texts": texts,
+                "gold_idx": labels.index(ans_key),
+            }
+        )
+        if len(out) >= n_samples:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +558,7 @@ def load_2wiki_samples(
     candidates = list(p_dir.rglob("validation*.parquet"))
     if not candidates:
         raise FileNotFoundError(f"2WikiMultihopQA validation parquet not found under {p_dir}")
-    table = pq.read_table(candidates[0])
-    rows = table.to_pylist()
+    rows = _read_parquet_rows(candidates[0])
     rng = random.Random(seed)
     indices = list(range(len(rows)))
     rng.shuffle(indices)
@@ -410,8 +654,7 @@ def map_char_spans_to_blocks(
 # ---------------------------------------------------------------------------
 
 def _load_wikitext_articles(parquet_path: Path) -> list[str]:
-    table = pq.read_table(parquet_path)
-    lines = [str(r.get("text", "")) for r in table.to_pylist()]
+    lines = [str(r.get("text", "")) for r in _read_parquet_rows(parquet_path)]
     articles: list[str] = []
     buf: list[str] = []
     for line in lines:
@@ -432,9 +675,8 @@ def _load_wikitext_articles(parquet_path: Path) -> list[str]:
 
 
 def _load_humaneval_docs(parquet_path: Path) -> list[str]:
-    table = pq.read_table(parquet_path)
     docs: list[str] = []
-    for row in table.to_pylist():
+    for row in _read_parquet_rows(parquet_path):
         prompt = str(row.get("prompt", ""))
         sol = str(row.get("canonical_solution", ""))
         test = str(row.get("test", ""))
