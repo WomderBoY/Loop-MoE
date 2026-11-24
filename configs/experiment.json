@@ -1,0 +1,38 @@
+{
+  "idea": "idea2_expert_unbinding",
+  "assets": ["ifm_ouro", "ifm_huginn", "datasets"],
+  "need_xllm": true,
+  "preferred_gpu": 5,
+  "seed": 20261124,
+  "seq_len": 320,
+  "n_calib_a": 16,
+  "n_calib_b": 16,
+  "n_adapt_train": 64,
+  "n_eval_heldout": 32,
+  "n_cf_train_seqs": 16,
+  "n_cf_eval_seqs": 16,
+  "cf_step_norm_eps": 0.08,
+  "adapt_lr": 0.0003,
+  "adapt_grad_accum": 2,
+  "lora_alpha": 16.0,
+  "models": {
+    "ouro_moe": {
+      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b",
+      "tracked_layers": [2, 7, 12, 17, 22, 26],
+      "n_loops": 4,
+      "k_per_layer": 5,
+      "rank_selected": 5,
+      "rank_recon": 6,
+      "cf_experts_per_layer": 5
+    },
+    "huginn_moe": {
+      "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b",
+      "tracked_layers": [9, 12, 15, 18],
+      "n_loops": 8,
+      "k_per_layer": 5,
+      "rank_selected": 5,
+      "rank_recon": 4,
+      "cf_experts_per_layer": 6
+    }
+  }
+}
