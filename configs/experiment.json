@@ -1,0 +1,15 @@
+{
+  "idea": "idea1_kv_depth",
+  "assets": ["ouro14b", "datasets"],
+  "need_xllm": false,
+  "preferred_gpu": 0,
+  "seed": 20261124,
+  "n_synth_base_docs": 48,
+  "n_2wiki_samples": 96,
+  "min_prefix_tokens": 240,
+  "max_prefix_tokens": 900,
+  "n_decomp_chunks": 64,
+  "decomp_seq_len": 512,
+  "batch_chunk": 15,
+  "max_new_tokens": 10
+}
