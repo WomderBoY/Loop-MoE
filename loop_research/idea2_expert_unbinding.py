@@ -591,7 +591,8 @@ class ExpertLoRAHost(nn.Module):
         self.mode = mode
         self.rank = rank
         self.n_loops = n_loops
-        self.scale = alpha / max(rank, 1)
+        # Rank-stabilized rsLoRA scaling (alpha / sqrt(rank)) prevents artificial LR bias across ranks
+        self.scale = alpha / math.sqrt(max(rank, 1))
         self.by_layer: dict[int, list[int]] = {}
         for lid, e in selected_experts:
             self.by_layer.setdefault(lid, []).append(e)
@@ -673,6 +674,94 @@ class ExpertLoRAHost(nn.Module):
         return y + delta_y if any_hit else y
 
 
+def allocate_conflict_ranks(
+    expert_records: list[dict[str, Any]],
+    total_rank_budget: int,
+    *,
+    score_key: str = "s_orth_both",
+    power: float = 0.5,
+) -> dict[tuple[int, int], int]:
+    """Allocate integer per-loop LoRA ranks summing exactly to total_rank_budget proportional to conflict^power."""
+    weights = np.array([max(float(r[score_key]), 0.0) ** power for r in expert_records], dtype=np.float64)
+    if weights.sum() <= 1e-12:
+        weights = np.ones_like(weights)
+    raw = weights / weights.sum() * total_rank_budget
+    floors = np.floor(raw).astype(int)
+    rem = int(total_rank_budget - floors.sum())
+    if rem > 0:
+        frac_idx = np.argsort(-(raw - floors))
+        for i in frac_idx[:rem]:
+            floors[i] += 1
+    out: dict[tuple[int, int], int] = {}
+    for r, rk in zip(expert_records, floors.tolist()):
+        if rk > 0:
+            out[(r["layer"], r["expert"])] = int(rk)
+    return out
+
+
+class VariableRankExpertLoRAHost(nn.Module):
+    """Per-loop W2 LoRA with expert-specific integer ranks allocated by conflict score (rsLoRA scaled)."""
+
+    def __init__(
+        self,
+        expert_ranks: dict[tuple[int, int], int],
+        *,
+        n_loops: int,
+        model_dim: int,
+        inter_dim: int,
+        alpha: float = 6.0,
+    ) -> None:
+        super().__init__()
+        self.n_loops = n_loops
+        self.alpha = alpha
+        self.by_layer: dict[int, list[tuple[int, int]]] = {}
+        for (lid, e), rk in sorted(expert_ranks.items()):
+            if rk > 0:
+                self.by_layer.setdefault(lid, []).append((e, rk))
+
+        self.params = nn.ParameterDict()
+        for lid, pairs in sorted(self.by_layer.items()):
+            for e_idx, rk in pairs:
+                A = nn.Parameter(torch.empty(n_loops, rk, inter_dim, dtype=torch.bfloat16))
+                B = nn.Parameter(torch.zeros(n_loops, model_dim, rk, dtype=torch.bfloat16))
+                nn.init.kaiming_uniform_(A, a=math.sqrt(5))
+                self.params[f"L{lid}_E{e_idx}_A"] = A
+                self.params[f"L{lid}_E{e_idx}_B"] = B
+
+    def num_trainable_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def apply_layer_delta(
+        self,
+        lid: int,
+        visit_r: int,
+        hidden: torch.Tensor,
+        y: torch.Tensor,
+        group_sizes: list[int],
+    ) -> torch.Tensor:
+        if lid not in self.by_layer or visit_r >= self.n_loops:
+            return y
+        offsets = []
+        acc = 0
+        for g in group_sizes:
+            offsets.append(acc)
+            acc += g
+        delta_y = torch.zeros_like(y)
+        any_hit = False
+        for e_idx, rk in self.by_layer[lid]:
+            cnt = group_sizes[e_idx]
+            if cnt == 0:
+                continue
+            any_hit = True
+            s = offsets[e_idx]
+            h_e = hidden[s : s + cnt]
+            A = self.params[f"L{lid}_E{e_idx}_A"][visit_r]
+            B = self.params[f"L{lid}_E{e_idx}_B"][visit_r]
+            scale = self.alpha / math.sqrt(max(rk, 1))
+            delta_y[s : s + cnt] = F.linear(F.linear(h_e, A), B) * scale
+        return y + delta_y if any_hit else y
+
+
 class RouterLoopModHost(nn.Module):
     """Freeze all experts; train per-loop router weight deltas + per-loop input modulation on tracked layers."""
 
@@ -735,7 +824,7 @@ def train_and_eval_condition(
             visit_cursor[lid] = 0
 
     try:
-        if isinstance(adapter_host, ExpertLoRAHost):
+        if isinstance(adapter_host, (ExpertLoRAHost, VariableRankExpertLoRAHost)):
             for lid in adapter_host.by_layer.keys():
                 exp_mod = model.layers[lid].moe.experts
                 orig_expert_fwds[lid] = exp_mod.forward
@@ -776,7 +865,7 @@ def train_and_eval_condition(
                         return TopKRouting.apply(
                             x_mod,
                             w_eff,
-                            mod.n_experts,
+                            mod.num_experts,
                             mod.topk,
                             mod.score_func,
                             mod.bias,
@@ -997,8 +1086,16 @@ def run_single_model_pilot(
     #   uniform_all: (len(tracked_layers)*n_experts) * n_loops * 1
     #   shared_plus_scalar: (len(tracked_layers)*k_per_layer) * (n_loops * rank_selected) + scalars
     #   recon_layer: n_experts * n_loops * rank_recon
+    total_rank_per_loop = len(tracked_layers) * k_per_layer * rank_selected
+    adaptive_ranks = allocate_conflict_ranks(expert_records, total_rank_per_loop, score_key="s_orth_both", power=0.5)
+    print(
+        f"[idea2:{model_key}] conflict_adaptive_rank: {len(adaptive_ranks)}/{len(expert_records)} active experts, "
+        f"sum_rank={sum(adaptive_ranks.values())}, max_rank={max(adaptive_ranks.values())}"
+    )
+
     cond_specs: list[tuple[str, nn.Module]] = [
         ("conflict_top", ExpertLoRAHost(groups["conflict_top"], mode="per_loop", rank=rank_selected, n_loops=n_loops, model_dim=model_dim, inter_dim=inter_dim, alpha=alpha)),
+        ("conflict_adaptive_rank", VariableRankExpertLoRAHost(adaptive_ranks, n_loops=n_loops, model_dim=model_dim, inter_dim=inter_dim, alpha=alpha)),
         ("matched_high", ExpertLoRAHost(groups["matched_high"], mode="per_loop", rank=rank_selected, n_loops=n_loops, model_dim=model_dim, inter_dim=inter_dim, alpha=alpha)),
         ("matched_low", ExpertLoRAHost(groups["matched_low"], mode="per_loop", rank=rank_selected, n_loops=n_loops, model_dim=model_dim, inter_dim=inter_dim, alpha=alpha)),
         ("random", ExpertLoRAHost(groups["random"], mode="per_loop", rank=rank_selected, n_loops=n_loops, model_dim=model_dim, inter_dim=inter_dim, alpha=alpha)),
@@ -1068,6 +1165,8 @@ def run_single_model_pilot(
         "matched_high_vs_matched_low": _contrast("matched_high", "matched_low"),
         "conflict_top_vs_shared_plus_scalar": _contrast("conflict_top", "shared_plus_scalar"),
         "conflict_top_vs_uniform_all": _contrast("conflict_top", "uniform_all"),
+        "adaptive_vs_uniform_all": _contrast("conflict_adaptive_rank", "uniform_all"),
+        "adaptive_vs_conflict_top": _contrast("conflict_adaptive_rank", "conflict_top"),
         "conflict_top_vs_gradnorm_top": _contrast("conflict_top", "gradnorm_top"),
         "conflict_top_vs_freq_top": _contrast("conflict_top", "freq_top"),
         "conflict_top_vs_recon_layer": _contrast("conflict_top", "recon_layer"),
@@ -1149,7 +1248,7 @@ def render_report_md(full_summary: dict[str, Any]) -> str:
         lines.append("| Condition | Trainable Params | Eval NLL (↓) | Δ NLL vs Base (↑) | 95% CI | Text NLL | Code NLL |")
         lines.append("|---|---:|---:|---:|---|---:|---:|")
         order = [
-            "base_frozen", "conflict_top", "matched_high", "matched_low", "random",
+            "base_frozen", "conflict_top", "conflict_adaptive_rank", "matched_high", "matched_low", "random",
             "gradnorm_top", "freq_top", "shared_plus_scalar", "uniform_all",
             "recon_layer", "router_loop_mod",
         ]
@@ -1206,7 +1305,7 @@ def main() -> None:
                     {"phase": f"{mkey}_verify", "of": 1, "unit": "check"},
                     {"phase": f"{mkey}_calib", "of": 3, "unit": "splits"},
                     {"phase": f"{mkey}_exp2a", "of": len(mspec["tracked_layers"]) * int(mspec.get("cf_experts_per_layer", 5)), "unit": "experts"},
-                    {"phase": f"{mkey}_exp2b", "of": 10, "unit": "conds"},
+                    {"phase": f"{mkey}_exp2b", "of": 11, "unit": "conds"},
                 ]
             )
         plan_stages.append({"phase": "report", "of": 1, "unit": "file"})

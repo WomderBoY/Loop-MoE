@@ -14,7 +14,7 @@
   "cf_step_norm_eps": 0.08,
   "adapt_lr": 0.0003,
   "adapt_grad_accum": 2,
-  "lora_alpha": 16.0,
+  "lora_alpha": 6.0,
   "models": {
     "ouro_moe": {
       "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b",
