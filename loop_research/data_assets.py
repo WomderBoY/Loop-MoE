@@ -49,6 +49,75 @@ MODEL_REPOS: dict[str, tuple[str, str]] = {
     "ifm_huginn": ("IFM/LoopedLM-P1-moe-huginn-500b", "IFM__LoopedLM-P1-moe-huginn-500b"),
 }
 
+MODELSCOPE_MODEL_REPOS: dict[str, tuple[str, list[str]]] = {
+    "ouro26b_thinking": (
+        "bytedance-community/Ouro-2.6B-Thinking",
+        [
+            "config.json",
+            "configuration_ouro.py",
+            "modeling_ouro.py",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "vocab.json",
+            "model.safetensors",
+        ],
+    ),
+    "ouro14b": (
+        "bytedance-community/Ouro-1.4B",
+        [
+            "config.json",
+            "configuration_ouro.py",
+            "modeling_ouro.py",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "vocab.json",
+            "model.safetensors",
+        ],
+    ),
+}
+
+
+def _download_model_via_modelscope_aria2(asset: str, target: Path) -> bool:
+    """Fast domestic ModelScope mirror download using aria2c (resumable multi-connection)."""
+    import shutil
+    import subprocess
+
+    if asset not in MODELSCOPE_MODEL_REPOS:
+        return False
+    aria2 = shutil.which("aria2c")
+    if not aria2:
+        return False
+    ms_repo, files = MODELSCOPE_MODEL_REPOS[asset]
+    target.mkdir(parents=True, exist_ok=True)
+    for fname in files:
+        dest = target / fname
+        if dest.is_file() and dest.stat().st_size > 0 and not (target / f"{fname}.aria2").exists():
+            continue
+        url = f"https://modelscope.cn/models/{ms_repo}/resolve/master/{fname}"
+        print(f"[download] ModelScope aria2c: {url} -> {dest}")
+        cmd = [
+            aria2,
+            "-x", "8",
+            "-s", "8",
+            "-k", "4M",
+            "-c",
+            "--file-allocation=none",
+            "--summary-interval=15",
+            "--console-log-level=warn",
+            "-d", str(target),
+            "-o", fname,
+            url,
+        ]
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+            print(f"[download] ModelScope aria2c failed for {fname} (rc={proc.returncode}); falling back to HF.")
+            return False
+    return True
+
 
 def _download_dynamic_dataset(ds_key: str, ds_root: Path) -> str:
     """Download parquet/jsonl files for a dataset by querying HfApi file listing."""
@@ -122,12 +191,14 @@ def download_requested_assets(
             if has_config and has_weights:
                 print(f"[download] Model {repo_id} already cached at {target}")
             else:
-                print(f"[download] Downloading model {repo_id} -> {target} (endpoint={os.environ.get('HF_ENDPOINT', 'default')})")
-                snapshot_download(
-                    repo_id=repo_id,
-                    local_dir=str(target),
-                    ignore_patterns=["*.png", "*.jpg", "*.gif", "*.md"],
-                )
+                ok_ms = _download_model_via_modelscope_aria2(asset, target)
+                if not ok_ms:
+                    print(f"[download] Downloading model {repo_id} -> {target} (endpoint={os.environ.get('HF_ENDPOINT', 'default')})")
+                    snapshot_download(
+                        repo_id=repo_id,
+                        local_dir=str(target),
+                        ignore_patterns=["*.png", "*.jpg", "*.gif", "*.md"],
+                    )
             resolved[asset] = str(target)
         elif asset == "datasets":
             for ds_key, (repo_id, files) in DATASET_SPECS.items():
