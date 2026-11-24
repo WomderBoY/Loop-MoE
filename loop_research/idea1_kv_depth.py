@@ -426,21 +426,57 @@ def extract_causal_block_features(
     return feats
 
 
+SYNTH_2SHOT_HEADER = (
+    "Read the records and answer with only the exact city name.\n\n"
+    "Example 1:\n"
+    "Record 01: Coordinator Alice Chen was appointed to oversee Project Amber.\n"
+    "Record 02: Project Amber maintains its primary headquarters in Lisbon.\n"
+    "Question: In which city is the project overseen by Alice Chen headquartered?\n"
+    "Answer: Lisbon\n\n"
+    "Example 2:\n"
+    "Record 01: Coordinator David Park was appointed to oversee Project Cedar.\n"
+    "Record 02: Project Cedar maintains its primary headquarters in Zurich.\n"
+    "Question: In which city is the project overseen by David Park headquartered?\n"
+    "Answer: Zurich\n\n"
+    "Records:\n"
+)
+
+WIKI_2SHOT_HEADER = (
+    "Read the passages and give only the short exact answer.\n\n"
+    "Example 1:\n"
+    "[Riverdale] Riverdale is a film directed by John Ford.\n"
+    "[John Ford] John Ford was born in Cape Elizabeth, Maine.\n"
+    "Question: Where was the director of Riverdale born?\n"
+    "Answer: Cape Elizabeth, Maine\n\n"
+    "Example 2:\n"
+    "[Alpha Tower] Alpha Tower was designed by architect Maria Lopez.\n"
+    "[Maria Lopez] Maria Lopez graduated from Delft University.\n"
+    "Question: Which university did the architect of Alpha Tower graduate from?\n"
+    "Answer: Delft University\n\n"
+    "Passages:\n"
+)
+
+
 def _build_30_masks(
     total_len: int,
     block_spans: list[tuple[int, int]],
-    prefix_len: int,
+    doc_start: int,
+    doc_end: int,
     device: torch.device,
 ) -> tuple[list[str], torch.Tensor]:
-    """Return names and [30, L] bool tensor: all_shallow, all_deep, and 28 2-of-8 combos."""
+    """Return names and [30, L] bool tensor: all_shallow, all_deep, and 28 2-of-8 combos.
+
+    Header/sink tokens [0, doc_start) AND question+answer suffix [doc_end, total_len) are
+    ALWAYS 4 loops across all 30 configs so BOS attention sinks never confound block selection.
+    """
     names: list[str] = ["all_shallow", "all_deep"] + [f"b{i}_{j}" for i, j in COMBOS_2_OF_8]
     masks = torch.zeros((30, total_len), device=device, dtype=torch.bool)
-    # Suffix (question + answer) is ALWAYS 4 loops across all 30 configs
-    masks[:, prefix_len:] = True
-    # Config 0: all_shallow (only suffix active)
+    masks[:, :doc_start] = True
+    masks[:, doc_end:] = True
+    # Config 0: all_shallow (only header/sink + suffix active)
     # Config 1: all_deep (entire sequence active)
     masks[1, :] = True
-    # Configs 2..29: 2 deep prefix blocks + suffix
+    # Configs 2..29: header/sink + 2 deep document blocks + suffix
     for c_idx, (b1, b2) in enumerate(COMBOS_2_OF_8):
         s1, e1 = block_spans[b1]
         s2, e2 = block_spans[b2]
@@ -484,25 +520,35 @@ def evaluate_qa_probe(
     prefix_cache_key: str | None = None
     cached_prefix_feats: list[dict[str, float]] | None = None
 
+    header_text = SYNTH_2SHOT_HEADER if probe_name == "synth" else WIKI_2SHOT_HEADER
+    header_ids = tokenizer.encode(header_text, add_special_tokens=True)
+
     for idx, item in enumerate(samples, 1):
-        prefix_ids = tokenizer.encode(item["prefix_text"], add_special_tokens=True)
-        suffix_ids = tokenizer.encode(item["question_suffix"], add_special_tokens=False)
+        doc_ids = tokenizer.encode(item["prefix_text"], add_special_tokens=False)
+        # Clean concise question suffix matching 2-shot examples
+        raw_suffix = item["question_suffix"]
+        q_pos = raw_suffix.find("Question:")
+        clean_suffix = "\n" + raw_suffix[q_pos:] if q_pos >= 0 else raw_suffix
+        suffix_ids = tokenizer.encode(clean_suffix, add_special_tokens=False)
         ans_ids = tokenizer.encode(item["gold_answer"], add_special_tokens=False)
-        if not ans_ids:
+        if not ans_ids or len(doc_ids) < 32:
             continue
 
-        prefix_len = len(prefix_ids)
-        prompt_len = prefix_len + len(suffix_ids)
-        full_ids = prefix_ids + suffix_ids + ans_ids
+        doc_start = len(header_ids)
+        doc_end = doc_start + len(doc_ids)
+        prefix_len = doc_end
+        prompt_len = doc_end + len(suffix_ids)
+        full_ids = header_ids + doc_ids + suffix_ids + ans_ids
         total_len = len(full_ids)
-        block_spans = split_prefix_into_blocks(prefix_len, 8)
+        rel_spans = split_prefix_into_blocks(len(doc_ids), 8)
+        block_spans = [(doc_start + s, doc_start + e) for s, e in rel_spans]
 
         # Ground-truth evidence blocks
         if "evidence_slots" in item:
             ev_spans = [item["para_spans"][s] for s in item["evidence_slots"]]
         else:
             ev_spans = [item["para_spans"][s] for s in item.get("support_para_indices", [])]
-        evidence_blocks = map_char_spans_to_blocks(item["prefix_text"], prefix_len, ev_spans, n_blocks=8)
+        evidence_blocks = map_char_spans_to_blocks(item["prefix_text"], len(doc_ids), ev_spans, n_blocks=8)
 
         full_tensor = torch.tensor([full_ids], device=device, dtype=torch.long)
         sh_full = engine.run_shallow_loops(full_tensor, shallow_loops=2)
@@ -516,7 +562,7 @@ def evaluate_qa_probe(
             cached_prefix_feats = causal_feats
 
         # 1) Teacher-forced Answer NLL across all 30 masks
-        mask_names, masks_full = _build_30_masks(total_len, block_spans, prefix_len, device)
+        mask_names, masks_full = _build_30_masks(total_len, block_spans, doc_start, doc_end, device)
         nll_by_cfg: list[float] = []
         target_ans = torch.tensor(ans_ids, device=device, dtype=torch.long)
         for start in range(0, 30, batch_chunk):
@@ -875,10 +921,12 @@ def run_probe_1c_decomposition(
         broken down by near (+1..32), mid (+33..128), and far (+129..).
     """
     rows: list[dict[str, Any]] = []
+    sink_tokens = 16
     for idx, ch in enumerate(chunks, 1):
         toks = ch["tokens"]
         seq_len = len(toks)
-        block_spans = split_prefix_into_blocks(seq_len, 8)
+        rel_spans = split_prefix_into_blocks(seq_len - sink_tokens, 8)
+        block_spans = [(sink_tokens + s, sink_tokens + e) for s, e in rel_spans]
         input_ids = torch.tensor([toks], device=device, dtype=torch.long)
         targets = input_ids[0, 1:]  # [L-1]
 
