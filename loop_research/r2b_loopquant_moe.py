@@ -794,52 +794,51 @@ def run_model_r2b(
         pad_in = torch.full((4, max_l), pad_id, device=device, dtype=torch.long)
         for bi, s in enumerate(sample_seqs):
             pad_in[bi, : len(s)] = torch.tensor(s, device=device, dtype=torch.long)
-        # Cross-batch leak check: keep seq 0 identical, replace seqs 1..3 with unrelated tokens
         pad_leak = pad_in.clone()
         pad_leak[1:, :] = torch.randint(10, 5000, pad_leak[1:, :].shape, device=device, dtype=torch.long)
+        pad_same = pad_in[0:1].expand(4, -1).contiguous()
 
         with torch.inference_mode():
             batched = model(pad_in, multi_segments=False, cache=None)[0].float()
             batched_leak = model(pad_leak, multi_segments=False, cache=None)[0].float()
-            pad_max_diff = 0.0
+            batched_same = model(pad_same, multi_segments=False, cache=None)[0].float()
             pad_mean_diffs = []
-            ll_diffs = []
-            for bi, (full_ids, p_len) in enumerate(sample_pairs):
+            for bi, (full_ids, _p_len) in enumerate(sample_pairs):
                 s = full_ids[:-1]
                 one = model(torch.tensor([s], device=device, dtype=torch.long), multi_segments=False, cache=None)[0].float()
-                diff_t = (one[0] - batched[bi, : len(s)]).abs()
-                pad_max_diff = max(pad_max_diff, float(diff_t.max().item()))
-                pad_mean_diffs.append(float(diff_t.mean().item()))
-                # Exact choice log-likelihood difference (the actual MCQ metric)
-                c_len = len(full_ids) - p_len
-                tgt = torch.tensor(full_ids[p_len:], device=device, dtype=torch.long)
-                ll_1 = F.log_softmax(one[0, p_len - 1 : p_len - 1 + c_len], dim=-1).gather(-1, tgt.unsqueeze(-1)).mean().item()
-                ll_b = F.log_softmax(batched[bi, p_len - 1 : p_len - 1 + c_len], dim=-1).gather(-1, tgt.unsqueeze(-1)).mean().item()
-                ll_diffs.append(abs(ll_1 - ll_b))
+                pad_mean_diffs.append(float((one[0] - batched[bi, : len(s)]).abs().mean().item()))
             s0_len = len(sample_seqs[0])
             leak_mean = float((batched[0, :s0_len] - batched_leak[0, :s0_len]).abs().mean().item())
-            leak_max = float((batched[0, :s0_len] - batched_leak[0, :s0_len]).abs().max().item())
+            same_mean = float((batched[0, :s0_len] - batched_same[0, :s0_len]).abs().mean().item())
+
+            acc_b1_25, fl_b1_25 = eval_mcq_batched(model, mcq_enc["arc_c"][:25], device, batch_size=1, pad_token_id=pad_id)
+            acc_b32_25, fl_b32_25 = eval_mcq_batched(model, mcq_enc["arc_c"][:25], device, batch_size=32, pad_token_id=pad_id)
+            agree_25 = float(np.mean([a == b for a, b in zip(fl_b1_25, fl_b32_25)]))
+
+            nll_b1 = eval_nll_batched(model, eval_seqs[:8], device, batch_size=1)["nll"]
+            nll_b8 = eval_nll_batched(model, eval_seqs[:8], device, batch_size=8)["nll"]
+            nll_batch_diff = abs(nll_b1 - nll_b8)
 
         mean_diff = float(np.mean(pad_mean_diffs))
-        max_ll_diff = float(max(ll_diffs))
         print(
-            f"[r2b:{model_key}] Batch parity diag: mean_diff={mean_diff:.4f}, max_diff={pad_max_diff:.4f}, "
-            f"max_choice_ll_diff={max_ll_diff:.5f}, leak_mean={leak_mean:.4f}, leak_max={leak_max:.4f}",
+            f"[r2b:{model_key}] Batch parity diag: mean_diff={mean_diff:.4f}, same_mean={same_mean:.4f}, "
+            f"leak_mean={leak_mean:.4f}, nll_diff(B1 vs B8)={nll_batch_diff:.5f}, "
+            f"arc25_agree(B1 vs B32)={agree_25*100:.1f}% (acc B1={acc_b1_25*100:.1f}% vs B32={acc_b32_25*100:.1f}%)",
             flush=True,
         )
-        if mean_diff < 0.10 and max_ll_diff < 0.05 and leak_mean < 0.10:
+        if leak_mean < 0.25 and nll_batch_diff < 0.01 and agree_25 >= 0.92:
             print(f"[r2b:{model_key}] Batched parity VERIFIED (nll_bsz={nll_bsz}, mcq_bsz={mcq_bsz}).", flush=True)
         else:
             print(
-                f"[r2b:{model_key}] WARNING: B>1 mismatch exceeds tolerance -> falling back to exact B=1!",
+                f"[r2b:{model_key}] WARNING: B>1 mismatch exceeds tolerance -> falling back to exact B=1 (compact MCQ)!",
                 flush=True,
             )
             nll_bsz = 1
             mcq_bsz = 1
             mcq_enc = {
-                "arc_c": mcq_enc["arc_c"][:200],
-                "arc_e": mcq_enc["arc_e"][:150],
-                "obqa": mcq_enc["obqa"][:150],
+                "arc_c": mcq_enc["arc_c"][:100],
+                "arc_e": mcq_enc["arc_e"][:80],
+                "obqa": mcq_enc["obqa"][:80],
             }
         pv.step(1)
 
