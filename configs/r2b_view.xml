@@ -1,0 +1,23 @@
+<signal name="condition" label="Condition" />
+<signal name="avg_bits" label="Avg Bits" digits="2" />
+<signal name="vram_gb" label="Expert VRAM" digits="2" unit="GB" better="lower" />
+<signal name="delta_nll" label="ΔNLL vs BF16" digits="4" better="lower" sign="true" />
+<signal name="arc_c" label="ARC-C (1172)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="arc_e" label="ARC-E (600)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="obqa" label="OBQA (500)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="avg_mcq" label="Avg MCQ (2272)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="latest_avg_mcq" label="Latest Avg MCQ" digits="1" scale="100" unit="%" better="higher" />
+<signal name="latest_dnll" label="Latest ΔNLL" digits="4" better="lower" sign="true" />
+<signal name="ouro_moe_m250_vs_freq_nll" label="Ouro 2.5b LoopQuant vs Freq NLL" digits="4" better="higher" sign="true" />
+<signal name="ouro_moe_m250_vs_freq_mcq" label="Ouro 2.5b LoopQuant vs Freq MCQ" digits="2" unit="pp" better="higher" sign="true" />
+<signal name="huginn_moe_m250_vs_freq_nll" label="Huginn 2.5b LoopQuant vs Freq NLL" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_m250_vs_freq_mcq" label="Huginn 2.5b LoopQuant vs Freq MCQ" digits="2" unit="pp" better="higher" sign="true" />
+<signal name="ouro_moe_m250_vs_unw_nll" label="Ouro 2.5b Loop vs Unw-MSE NLL" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_m250_vs_unw_nll" label="Huginn 2.5b Loop vs Unw-MSE NLL" digits="4" better="higher" sign="true" />
+<signal name="ouro_moe_w2_ss_vs_pool_nll" label="Ouro W2 StageSens vs Pool AWQ" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_w2_ss_vs_pool_nll" label="Huginn W2 StageSens vs Pool AWQ" digits="4" better="higher" sign="true" />
+<view headline="huginn_moe_m250_vs_freq_mcq ouro_moe_m250_vs_freq_mcq latest_avg_mcq">
+  <stats of="ouro_moe_m250_vs_freq_nll ouro_moe_m250_vs_freq_mcq huginn_moe_m250_vs_freq_nll huginn_moe_m250_vs_freq_mcq ouro_moe_m250_vs_unw_nll huginn_moe_m250_vs_unw_nll ouro_moe_w2_ss_vs_pool_nll huginn_moe_w2_ss_vs_pool_nll" vs="final" />
+  <table name="ouro_moe_results" columns="condition avg_bits vram_gb delta_nll arc_c arc_e obqa avg_mcq" title="Ouro-MoE LoopQuant Results" />
+  <table name="huginn_moe_results" columns="condition avg_bits vram_gb delta_nll arc_c arc_e obqa avg_mcq" title="Huginn-MoE LoopQuant Results" />
+</view>

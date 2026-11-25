@@ -81,6 +81,14 @@ elif [[ "$IDEA" == "probe1_loopmoe_quant" ]]; then
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "r2b_loopquant_moe" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_r2b_loopquant.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.r2b_loopquant_moe \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1

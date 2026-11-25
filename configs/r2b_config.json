@@ -1,0 +1,8 @@
+{
+  "brief": {
+    "question": "Does LoopQuant-MoE (StageSens-Traj-AWQ + Stage-Sensitivity-Weighted {2,3,4}-bit Knapsack) beat RTN, Loop0-AWQ, Standard-Pool-AWQ, Global-Freq, Max-Stage-Freq, and Unweighted-MSE ablation on BOTH Ouro-MoE and Huginn-MoE across NLL (n=64) + 2,272 MCQ items (ARC-C, ARC-E, OBQA)?",
+    "healthy": "Exactness passes (<5e-2); batched eval advances every ~20-40s across 24 conditions per model (~24-32 min total across both models).",
+    "noise": "Waiting briefly for an idle GPU or downloading arc_easy/openbookqa once is expected.",
+    "worth_a_flag": "Any exactness failure, NaN NLL, or OOM error."
+  }
+}
