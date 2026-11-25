@@ -1426,6 +1426,67 @@ def evaluate_math_generation(
 # Per-Model Full Pipeline
 # ---------------------------------------------------------------------------
 
+def load_ouro_for_transformers5(model_path: Path, device: torch.device):
+    """Load ByteDance/Ouro-* cleanly under both transformers 4.x and 5.x."""
+    import inspect
+    import sys
+    from transformers import AutoConfig, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    def _default_rope_init(config, device=None, seq_len=None):
+        base = getattr(config, "rope_theta", 1000000.0)
+        dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
+
+    if "default" not in ROPE_INIT_FUNCTIONS:
+        ROPE_INIT_FUNCTIONS["default"] = _default_rope_init
+
+    cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+    if not hasattr(cfg, "pad_token_id"):
+        cfg.pad_token_id = None
+
+    cls = get_class_from_dynamic_module("modeling_ouro.OuroForCausalLM", str(model_path))
+    mod = sys.modules[cls.__module__]
+    if not hasattr(mod.OuroRotaryEmbedding, "compute_default_rope_parameters"):
+        mod.OuroRotaryEmbedding.compute_default_rope_parameters = staticmethod(_default_rope_init)
+
+    if hasattr(mod, "create_causal_mask"):
+        orig_ccm = mod.create_causal_mask
+        sig = inspect.signature(orig_ccm)
+
+        def _compat_ccm(**kw):
+            if "input_embeds" in kw and "inputs_embeds" not in kw and "inputs_embeds" in sig.parameters:
+                kw["inputs_embeds"] = kw.pop("input_embeds")
+            filtered = {k: v for k, v in kw.items() if k in sig.parameters}
+            return orig_ccm(**filtered)
+
+        mod.create_causal_mask = _compat_ccm
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    try:
+        model = cls.from_pretrained(
+            str(model_path),
+            config=cfg,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+    except TypeError:
+        model = cls.from_pretrained(
+            str(model_path),
+            config=cfg,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+    model = model.to(device).eval()
+    return model, tokenizer
+
+
 def run_model_pilot(
     mspec: dict[str, Any],
     *,
@@ -1446,16 +1507,7 @@ def run_model_pilot(
     local_path = model_dir / mspec["local_dir"]
 
     print(f"\n[ftrs:{mkey}] Loading {local_path} (is_thinking={is_thinking}) ...")
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(str(local_path), trust_remote_code=True)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        str(local_path),
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(device)
-    model.eval()
+    model, tokenizer = load_ouro_for_transformers5(local_path, device)
     engine = OuroCalibratedEngine(model, device)
 
     # 0) Verify exactness
