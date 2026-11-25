@@ -1,0 +1,8 @@
+{
+  "brief": {
+    "question": "How badly do IFM Ouro-MoE and Huginn-MoE degrade under W4/W3/W2 PTQ, how much comes from cross-loop routing-flip cascade vs weight distortion, and does feedback/stage-aware mixed precision beat global frequency?",
+    "healthy": "Exactness passes with 0.0 diff; BF16 NLL ~2.12 (Ouro) and ~2.10 (Huginn); sweep runs ~16-20 min total across both models.",
+    "noise": "First-time CUDA warmup or short wait for an idle GPU is expected on shared server.",
+    "worth_a_flag": "Any exactness failure, NaN NLL, or OOM error."
+  }
+}

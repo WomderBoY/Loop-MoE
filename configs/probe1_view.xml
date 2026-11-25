@@ -1,0 +1,15 @@
+<signal name="condition" label="Condition" />
+<signal name="avg_bits" label="Avg Expert Bits" digits="2" />
+<signal name="delta_nll" label="ΔNLL vs BF16" digits="4" better="lower" sign="true" />
+<signal name="arc_acc" label="ARC-150 Acc" digits="1" scale="100" unit="%" better="higher" />
+<signal name="rec_flip_any" label="Recurrent Flip-Any" digits="1" scale="100" unit="%" better="lower" />
+<signal name="ouro_moe_w2_cascade_frac" label="Ouro W2 Route Cascade Share" digits="1" scale="100" unit="%" />
+<signal name="huginn_moe_w2_cascade_frac" label="Huginn W2 Route Cascade Share" digits="1" scale="100" unit="%" />
+<signal name="ouro_moe_fb_vs_freq_24b" label="Ouro 2.4b Feedback vs Freq" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_fb_vs_freq_24b" label="Huginn 2.4b Feedback vs Freq" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_rec_vs_nonrec" label="Huginn Rec-W4 vs NonRec-W4" digits="4" better="higher" sign="true" />
+<view headline="huginn_moe_w2_cascade_frac ouro_moe_w2_cascade_frac huginn_moe_fb_vs_freq_24b">
+  <stats of="ouro_moe_w2_cascade_frac huginn_moe_w2_cascade_frac ouro_moe_fb_vs_freq_24b huginn_moe_fb_vs_freq_24b huginn_moe_rec_vs_nonrec" vs="final" />
+  <table name="ouro_moe_conds" columns="condition avg_bits delta_nll arc_acc rec_flip_any" title="IFM Ouro-MoE Quantization Sweep" />
+  <table name="huginn_moe_conds" columns="condition avg_bits delta_nll arc_acc rec_flip_any" title="IFM Huginn-MoE Quantization Sweep" />
+</view>
