@@ -365,6 +365,8 @@ def calibrate_trajectory_quant(
     topo: list[dict[str, Any]],
     calib_seqs: list[dict[str, Any]],
     device: torch.device,
+    *,
+    batch_size: int = 8,
 ) -> dict[str, Any]:
     """Collect per-(layer, visit, expert) input & SwiGLU-mid squared activation sums,
     weighted output energy, counts, AND per-visit skip-MoE NLL sensitivity alpha_{l,v}.
@@ -452,8 +454,8 @@ def calibrate_trajectory_quant(
 
             moe.forward = make_calib(lid, moe)
 
-        for s0 in range(0, len(calib_seqs), 8):
-            batch = calib_seqs[s0 : s0 + 8]
+        for s0 in range(0, len(calib_seqs), batch_size):
+            batch = calib_seqs[s0 : s0 + batch_size]
             toks = torch.tensor([b["tokens"] for b in batch], device=device, dtype=torch.long)
             for l in range(n_layers):
                 visits[l] = 0
@@ -464,7 +466,7 @@ def calibrate_trajectory_quant(
 
     # Measure per-visit routed-MoE sensitivity alpha_{l,v} = DeltaNLL(skip routed MoE at (l,v)) on calib[:8]
     calib_sub = calib_seqs[:8]
-    base_cal = eval_nll_batched(model, calib_sub, device, batch_size=8)["nll"]
+    base_cal = eval_nll_batched(model, calib_sub, device, batch_size=batch_size)["nll"]
     visit_sens = np.zeros((n_layers, max_v), dtype=np.float64)
 
     for d in topo:
@@ -486,11 +488,15 @@ def calibrate_trajectory_quant(
 
         try:
             moe_t.forward = skip_once
-            # Note: batch_size=8 runs all 8 calib sequences in a SINGLE forward pass so ctr resets cleanly!
-            ctr[0] = 0
-            toks = torch.tensor([b["tokens"] for b in calib_sub], device=device, dtype=torch.long)
-            logits, _, _ = model(toks[:, :-1], multi_segments=False, cache=None)
-            nll_s = float(F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), toks[:, 1:].reshape(-1)).item())
+            losses = []
+            for s0 in range(0, len(calib_sub), batch_size):
+                batch = calib_sub[s0 : s0 + batch_size]
+                ctr[0] = 0
+                toks = torch.tensor([b["tokens"] for b in batch], device=device, dtype=torch.long)
+                logits, _, _ = model(toks[:, :-1], multi_segments=False, cache=None)
+                l_val = float(F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), toks[:, 1:].reshape(-1)).item())
+                losses.append(l_val * len(batch))
+            nll_s = float(sum(losses) / len(calib_sub))
             visit_sens[lid_t, v_t] = max(1e-5, nll_s - base_cal)
         finally:
             moe_t.forward = orig_t
@@ -778,27 +784,68 @@ def run_model_r2b(
         raw_pad = getattr(tokenizer, "bos_id", 0)
     pad_id = max(0, int(raw_pad))
 
-    # 1) Verify exactness of restore & right-padded batching
+    # 1) Verify exactness of right-padded batching (distinguish benign BF16 router-tie from real batch leak!)
+    nll_bsz = 8
+    mcq_bsz = 32
     with run_obj.phase(f"{model_key}_verify", total=1, unit="check") as pv:
-        sample_seqs = [mcq_enc["arc_c"][i]["choices"][0][0][:-1] for i in range(4)]
+        sample_pairs = [mcq_enc["arc_c"][i]["choices"][0] for i in range(4)]
+        sample_seqs = [p[0][:-1] for p in sample_pairs]
         max_l = max(len(s) for s in sample_seqs)
         pad_in = torch.full((4, max_l), pad_id, device=device, dtype=torch.long)
         for bi, s in enumerate(sample_seqs):
             pad_in[bi, : len(s)] = torch.tensor(s, device=device, dtype=torch.long)
+        # Cross-batch leak check: keep seq 0 identical, replace seqs 1..3 with unrelated tokens
+        pad_leak = pad_in.clone()
+        pad_leak[1:, :] = torch.randint(10, 5000, pad_leak[1:, :].shape, device=device, dtype=torch.long)
+
         with torch.inference_mode():
             batched = model(pad_in, multi_segments=False, cache=None)[0].float()
-            pad_diff = 0.0
-            for bi, s in enumerate(sample_seqs):
+            batched_leak = model(pad_leak, multi_segments=False, cache=None)[0].float()
+            pad_max_diff = 0.0
+            pad_mean_diffs = []
+            ll_diffs = []
+            for bi, (full_ids, p_len) in enumerate(sample_pairs):
+                s = full_ids[:-1]
                 one = model(torch.tensor([s], device=device, dtype=torch.long), multi_segments=False, cache=None)[0].float()
-                pad_diff = max(pad_diff, float((one[0] - batched[bi, : len(s)]).abs().max().item()))
-        print(f"[r2b:{model_key}] Exactness OK: pad_batch_diff={pad_diff:.2e}", flush=True)
-        if pad_diff > 5e-2:
-            raise RuntimeError(f"Batched MCQ parity failed: {pad_diff}")
+                diff_t = (one[0] - batched[bi, : len(s)]).abs()
+                pad_max_diff = max(pad_max_diff, float(diff_t.max().item()))
+                pad_mean_diffs.append(float(diff_t.mean().item()))
+                # Exact choice log-likelihood difference (the actual MCQ metric)
+                c_len = len(full_ids) - p_len
+                tgt = torch.tensor(full_ids[p_len:], device=device, dtype=torch.long)
+                ll_1 = F.log_softmax(one[0, p_len - 1 : p_len - 1 + c_len], dim=-1).gather(-1, tgt.unsqueeze(-1)).mean().item()
+                ll_b = F.log_softmax(batched[bi, p_len - 1 : p_len - 1 + c_len], dim=-1).gather(-1, tgt.unsqueeze(-1)).mean().item()
+                ll_diffs.append(abs(ll_1 - ll_b))
+            s0_len = len(sample_seqs[0])
+            leak_mean = float((batched[0, :s0_len] - batched_leak[0, :s0_len]).abs().mean().item())
+            leak_max = float((batched[0, :s0_len] - batched_leak[0, :s0_len]).abs().max().item())
+
+        mean_diff = float(np.mean(pad_mean_diffs))
+        max_ll_diff = float(max(ll_diffs))
+        print(
+            f"[r2b:{model_key}] Batch parity diag: mean_diff={mean_diff:.4f}, max_diff={pad_max_diff:.4f}, "
+            f"max_choice_ll_diff={max_ll_diff:.5f}, leak_mean={leak_mean:.4f}, leak_max={leak_max:.4f}",
+            flush=True,
+        )
+        if mean_diff < 0.10 and max_ll_diff < 0.05 and leak_mean < 0.10:
+            print(f"[r2b:{model_key}] Batched parity VERIFIED (nll_bsz={nll_bsz}, mcq_bsz={mcq_bsz}).", flush=True)
+        else:
+            print(
+                f"[r2b:{model_key}] WARNING: B>1 mismatch exceeds tolerance -> falling back to exact B=1!",
+                flush=True,
+            )
+            nll_bsz = 1
+            mcq_bsz = 1
+            mcq_enc = {
+                "arc_c": mcq_enc["arc_c"][:200],
+                "arc_e": mcq_enc["arc_e"][:150],
+                "obqa": mcq_enc["obqa"][:150],
+            }
         pv.step(1)
 
     # 2) Trajectory activation + sensitivity calibration + distortion tables
     with run_obj.phase(f"{model_key}_calib", total=1, unit="pass") as pc:
-        calib = calibrate_trajectory_quant(model, topo, calib_seqs, device)
+        calib = calibrate_trajectory_quant(model, topo, calib_seqs, device, batch_size=nll_bsz)
         qm = LoopQuantManager(model, topo, calib)
         # Precompute exact distortion tables for both Pool-AWQ and StageSens-AWQ and RTN
         dist_ss_awq = qm.precompute_distortion_tables(awq_mode="stagesens", group_size=128, device=device)
@@ -869,12 +916,12 @@ def run_model_r2b(
             t_c0 = time.time()
             avg_b = qm.apply_quantization(c["bits"], awq_mode=c["awq"], group_size=c["gs"])
             vram = compute_expert_vram_gb(c["bits"], D, I, group_size=c["gs"])
-            nll_res = eval_nll_batched(model, eval_seqs, device, batch_size=8)
+            nll_res = eval_nll_batched(model, eval_seqs, device, batch_size=nll_bsz)
 
             mcq_accs: dict[str, float] = {}
             mcq_flags: dict[str, list[int]] = {}
             for ds_name, enc_items in mcq_enc.items():
-                acc, fl = eval_mcq_batched(model, enc_items, device, batch_size=32, pad_token_id=pad_id)
+                acc, fl = eval_mcq_batched(model, enc_items, device, batch_size=mcq_bsz, pad_token_id=pad_id)
                 mcq_accs[ds_name] = acc
                 mcq_flags[ds_name] = fl
             avg_mcq = float(np.mean(list(mcq_accs.values())))
