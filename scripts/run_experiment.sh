@@ -73,6 +73,14 @@ elif [[ "$IDEA" == "new_dir2_vsubmoe" ]]; then
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "load_once_offload" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_load_once*.py' -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.load_once_offload \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
 elif [[ "$IDEA" == "load_once_pilot" ]]; then
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_load_once.py' -v
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.load_once \

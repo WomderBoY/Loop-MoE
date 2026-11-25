@@ -1,11 +1,12 @@
-<signal name="delta_nll" label="NLL penalty" unit="nats" digits="4" better="lower" />
-<signal name="logical_copies" label="Logical expert copies per token" digits="2" better="lower" />
-<signal name="agreement" label="Teacher token agreement" scale="100" unit="%" digits="2" better="higher" />
-<signal name="accuracy" label="ARC accuracy" scale="100" unit="%" digits="2" better="higher" />
-<signal name="nll_live" label="Current sequence NLL" digits="3" better="lower" />
-<signal name="arc_live" label="Current ARC accuracy" scale="100" unit="%" digits="2" better="higher" />
-<view headline="arc_live nll_live">
- <table name="quality" columns="model split condition delta_nll logical_copies agreement" />
- <table name="arc" columns="model condition accuracy" />
- <text>Quality screening with all weights resident. Logical copies are not measured offload latency. First-visit buffers are charged against the cache budget.</text>
+<signal name="tpot_ms" label="TPOT" unit="ms/token" digits="2" better="lower" />
+<signal name="tpot_live" label="Current TPOT" unit="ms/token" digits="2" better="lower" />
+<signal name="copies" label="Expert copies/token" digits="2" better="lower" />
+<signal name="agreement" label="Full-resident agreement" unit="%" scale="100" digits="1" better="higher" />
+<signal name="nll_live" label="Calibration NLL" digits="3" better="lower" />
+<signal name="speedup_static" label="TPOT reduction vs exact static" unit="%" digits="2" better="higher" />
+<signal name="speedup_hot" label="TPOT reduction vs hot-only" unit="%" digits="2" better="higher" />
+<view headline="tpot_live nll_live">
+<table name="timings" columns="model budget policy task tpot_ms copies agreement" />
+<table name="summary" columns="model budget task policy tpot_ms speedup_static speedup_hot" />
+<text>Physical expert cache includes static hot, first-visit retention and one scratch slot. Methods interleave on the same requests. Free generation is primary; identical-input replay is secondary.</text>
 </view>

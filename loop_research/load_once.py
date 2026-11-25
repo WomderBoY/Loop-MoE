@@ -25,7 +25,11 @@ from loop_research.ifm_runtime import bootstrap_xllm, load_ifm_model_for_autogra
 
 @contextmanager
 def stage(name, total, unit):
-    yield orx.progress(phase=name,total=total,unit=unit)
+    p=orx.progress(phase=name,total=total,unit=unit)
+    try:
+        yield p
+    finally:
+        p.flush()
 
 
 def decide(scores, selection, first, hot, *, mode, visit, recurrent, tau):
