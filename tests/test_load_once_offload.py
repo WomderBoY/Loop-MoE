@@ -1,10 +1,16 @@
 """Check persistent versus scratch lifetime without CUDA or model inference."""
 import unittest
 import torch
-from loop_research.load_once_offload import SlotPlan,legacy_runtime,compare_logits
+from loop_research.load_once_offload import SlotPlan,legacy_runtime,compare_logits,require_same_execution
 
 
 class TestSlots(unittest.TestCase):
+    def test_executor_check_is_strict_within_matched_path(self):
+        a=torch.tensor([2.,1.,0.]);routes=[[0,1],[1,2]]
+        require_same_execution(a,a.clone(),routes,routes)
+        with self.assertRaises(RuntimeError):require_same_execution(a,a+.001,routes,routes)
+        with self.assertRaises(RuntimeError):require_same_execution(a,a,routes,[[0,1],[2,3]])
+
     def test_diagnostics_separate_logits_from_decisions(self):
         a=torch.tensor([2.,1.,0.])
         same=compare_logits(a,a)

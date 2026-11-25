@@ -5,8 +5,10 @@
 <signal name="nll_live" label="Calibration NLL" digits="3" better="lower" />
 <signal name="speedup_static" label="TPOT reduction vs exact static" unit="%" digits="2" better="higher" />
 <signal name="speedup_hot" label="TPOT reduction vs hot-only" unit="%" digits="2" better="higher" />
+<signal name="delta_nll_kv" label="Incremental NLL penalty" unit="nats/token" digits="4" better="lower" />
 <view headline="tpot_live nll_live">
 <table name="timings" columns="model budget policy task tpot_ms copies agreement" />
 <table name="summary" columns="model budget task policy tpot_ms speedup_static speedup_hot" />
+<table name="quality_kv" columns="policy budget delta_nll_kv" />
 <text>Physical expert cache includes static hot, first-visit retention and one scratch slot. Methods interleave on the same requests. Free generation is primary; identical-input replay is secondary.</text>
 </view>

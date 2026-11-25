@@ -173,21 +173,45 @@ def generate(engine,executor,route,prompt,ntokens,device,forced=None):
 
 @torch.inference_mode()
 def verify_engine(model,engine,executor,route,prompt,device):
+    """Strict native-MoE versus direct-MoE comparison within the same KV path.
+
+    Full-prefix versus incremental differences are recorded by diagnose_paths;
+    they must not be attributed to this executor comparison.
+    """
     engine.reset()
+    native_engine=type(engine)(model,engine.model_spec)
     growing=list(prompt[:16])
     gaps=[]
-    for step in range(4):
-        route.reset()
-        exact=model(torch.tensor([growing],device=device),multi_segments=False,cache=None)[0][0,-1]
-        route.reset()
-        inp=growing if step==0 else [growing[-1]]
-        got=engine.forward_step(torch.tensor([inp],device=device),moe_executor=executor.execute_moe)[0,-1]
-        gap=float((exact.float()-got.float()).abs().max())
-        gaps.append(gap)
-        if int(exact.argmax())!=int(got.argmax()) or gap>.25:
-            raise RuntimeError(f"Incremental MoE executor mismatch: step={step}, gap={gap}")
-        growing.append(int(exact.argmax()))
-    print("ENGINE_VERIFY",json.dumps(dict(max_logit_gaps=gaps,greedy_exact=True)),flush=True)
+    captured=[]
+    handles=[]
+    def capture(_mod,_args,output):captured.append(output[1][0,-1].tolist())
+    for layer in model.layers:handles.append(layer.moe.router.register_forward_hook(capture))
+    try:
+        for step in range(8):
+            inp=growing if step==0 else [growing[-1]]
+            ids=torch.tensor([inp],device=device)
+            route.reset();captured.clear()
+            exact=native_engine.forward_step(ids)[0,-1]
+            native_routes=list(captured)
+            route.reset();captured.clear()
+            got=engine.forward_step(ids,moe_executor=executor.execute_moe)[0,-1]
+            require_same_execution(exact,got,native_routes,list(captured))
+            gaps.append(float((exact.float()-got.float()).abs().max()))
+            growing.append(int(exact.argmax()))
+    finally:
+        for handle in handles:handle.remove()
+    print("ENGINE_VERIFY",json.dumps(dict(comparison="native_KV_vs_direct_KV",max_logit_gaps=gaps,
+        greedy_exact=True,routes_exact=True)),flush=True)
+
+
+def require_same_execution(reference,candidate,reference_routes,candidate_routes):
+    if reference_routes!=candidate_routes:
+        raise RuntimeError("Native/direct KV executor routing mismatch")
+    if not bool(torch.isfinite(reference).all() and torch.isfinite(candidate).all()):
+        raise RuntimeError("Nonfinite executor verification logits")
+    if not torch.equal(reference,candidate):
+        gap=float((reference.float()-candidate.float()).abs().max())
+        raise RuntimeError(f"Native/direct KV executor logits differ: gap={gap}")
 
 
 def compare_logits(reference,candidate):
@@ -282,6 +306,28 @@ def assert_own_gpu(idx):
                 cpu_load=list(os.getloadavg()))
 
 
+@torch.inference_mode()
+def incremental_nll(engine,executor,route,items,prefix_tokens,target_tokens,device,progress,offset):
+    values=[]
+    for i,item in enumerate(items):
+        tokens=item["tokens"]
+        prefix=min(prefix_tokens,len(tokens)-target_tokens)
+        if prefix<2:raise ValueError("NLL sequence too short")
+        engine.reset();route.reset()
+        logits=engine.forward_step(torch.tensor([tokens[:prefix]],device=device),moe_executor=executor.execute_moe)
+        losses=[]
+        for j in range(target_tokens):
+            target=torch.tensor([tokens[prefix+j]],device=device)
+            losses.append(float(F.cross_entropy(logits[0,-1:].float(),target)))
+            del logits
+            if j+1<target_tokens:
+                route.reset()
+                logits=engine.forward_step(target.view(1,1),moe_executor=executor.execute_moe)
+        values.append(dict(index=i,domain=item["domain"],nll=float(np.mean(losses))))
+        progress.step(offset+i+1)
+    return values
+
+
 def benchmark(cfg,args,device,idx):
     Engine,Store,Full=legacy_runtime()
     name,spec=next(iter(cfg["models"].items()))
@@ -318,13 +364,32 @@ def benchmark(cfg,args,device,idx):
         diagnose_paths(model,Engine,full,shape,configs,prompts[0],
                        cfg.get("diagnostic_steps",8),device,out)
         return
-    p=orx.progress(phase="verify",total=3,unit="policies")
-    for i,policy in enumerate(policies):
-        c=next(c for c in configs if c["policy"]==policy)
-        route=Routing(model,c["hot"],policy,cfg["tau"],False)
-        with route.attached():verify_engine(model,engine,full,route,prompts[0],device)
-        p.step(i+1)
+    p=orx.progress(phase="verify",total=len(configs)*2,unit="checks")
+    for i,c in enumerate(configs):
+        for j,prompt in enumerate(prompts[:2]):
+            route=Routing(model,c["hot"],c["policy"],cfg["tau"],False)
+            with route.attached():verify_engine(model,engine,full,route,prompt,device)
+            p.step(i*2+j+1)
     p.flush()
+    # Quality is rechecked on the actual incremental path before reporting any
+    # latency-quality claim. Full-prefix NLL from stage one is a separate result.
+    quality_items=splits["eval_heldout"][:cfg["quality_sequences"]]
+    p=orx.progress(phase="incremental_quality",total=len(configs)*len(quality_items),unit="sequences")
+    quality={}
+    native_quality=None
+    for i,c in enumerate(configs):
+        route=Routing(model,c["hot"],c["policy"],cfg["tau"],False)
+        with route.attached():
+            values=incremental_nll(engine,full,route,quality_items,cfg["prompt_tokens"],
+                cfg["quality_target_tokens"],device,p,i*len(quality_items))
+        if c["policy"]=="native":native_quality=values
+        delta=bootstrap([v["nll"]-b["nll"] for v,b in zip(values,native_quality)])
+        quality[c["key"]]=dict(rows=values,delta_nll=delta,nll=float(np.mean([v["nll"] for v in values])))
+        print("INCREMENTAL_QUALITY",json.dumps(dict(key=c["key"],delta_nll=delta,
+            nll=quality[c["key"]]["nll"],sequences=len(values),targets_per_sequence=cfg["quality_target_tokens"])),flush=True)
+        p.row("quality_kv",policy=c["policy"],budget=c["budget"],delta_nll_kv=delta["mean"])
+    p.flush()
+    (out/"incremental-quality.json").write_text(json.dumps(quality,indent=2))
     # Reference outputs for both free generation and matched-prefix replay.
     # They are produced with the same active-two-expert path as offload.
     refs={}
