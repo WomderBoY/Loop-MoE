@@ -38,6 +38,8 @@
   "decode_tokens": 32,
   "repeats": 3,
   "tau": 0.5,
-  "diagnostic_only": true,
-  "diagnostic_steps": 8
+  "diagnostic_only": false,
+  "diagnostic_steps": 8,
+  "quality_sequences": 32,
+  "quality_target_tokens": 16
 }
