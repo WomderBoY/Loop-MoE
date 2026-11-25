@@ -1671,46 +1671,51 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    gpu_info = acquire_idle_gpu(preferred_gpu=cfg.get("preferred_gpu"))
-    gpu_idx = int(gpu_info["index"])
-    torch.cuda.set_device(gpu_idx)
-    device = torch.device(f"cuda:{gpu_idx}")
-    print(f"[r3] Acquired idle GPU {gpu_idx}: {gpu_info['name']} (mem={gpu_info['memory_used_mb']}MiB, util={gpu_info['utilization_pct']}%)", flush=True)
-
-    boot = bootstrap_xllm(args.xllm_loop_dir)
-    print(f"[r3] xllm bootstrap: {json.dumps(boot)}", flush=True)
-
-    seed = int(cfg.get("seed", 20261126))
-    mcq_raw = {
-        "arc_c": load_arc_challenge_samples(args.dataset_dir, n_samples=int(cfg.get("n_arc_c", 0)), seed=seed),
-        "arc_e": load_arc_easy_samples(args.dataset_dir, n_samples=int(cfg.get("n_arc_e", 600)), seed=seed),
-        "obqa": load_openbookqa_samples(args.dataset_dir, n_samples=int(cfg.get("n_obqa", 500)), seed=seed),
-    }
-    print(f"[r3] Loaded MCQ suites: ARC-C={len(mcq_raw['arc_c'])}, ARC-E={len(mcq_raw['arc_e'])}, OBQA={len(mcq_raw['obqa'])}", flush=True)
-
-    model_specs = cfg["models"]
-    plan = [
-        {"phase": "setup", "of": 1, "unit": "env"},
-        {"phase": "download", "of": 1, "unit": "assets"},
-    ]
-    for mk in model_specs:
-        plan.extend(
-            [
-                {"phase": f"{mk}_verify", "of": 1, "unit": "check"},
-                {"phase": f"{mk}_calib", "of": 4, "unit": "steps"},
-                {"phase": f"{mk}_eval", "of": 22, "unit": "conds"},
-                {"phase": f"{mk}_speed", "of": 1, "unit": "bench"},
-                {"phase": f"{mk}_quant_ortho", "of": 2, "unit": "conds"},
-            ]
+    gpu_idx, gpu_lock, gpu_status = acquire_idle_gpu(cfg.get("preferred_gpu"))
+    try:
+        device = torch.device(f"cuda:{gpu_idx}")
+        torch.cuda.set_device(device)
+        print(
+            f"[r3] Acquired idle GPU {gpu_idx}: {gpu_status.name} "
+            f"(mem={gpu_status.mem_used_mib}MiB, util={gpu_status.util_pct}%)",
+            flush=True,
         )
-    plan.append({"phase": "report", "of": 1, "unit": "file"})
 
-    all_out: dict[str, Any] = {
-        "gpu_index": gpu_idx,
-        "gpu_name": gpu_info["name"],
-        "models": {},
-    }
-    with orx.run(plan=plan) as run_obj:
+        boot = bootstrap_xllm(args.xllm_loop_dir, attention_backend="sdpa")
+        print(f"[r3] xllm bootstrap: {json.dumps(boot)}", flush=True)
+
+        seed = int(cfg.get("seed", 20261126))
+        mcq_raw = {
+            "arc_c": load_arc_challenge_samples(args.dataset_dir, n_samples=int(cfg.get("n_arc_c", 0)), seed=seed),
+            "arc_e": load_arc_easy_samples(args.dataset_dir, n_samples=int(cfg.get("n_arc_e", 600)), seed=seed),
+            "obqa": load_openbookqa_samples(args.dataset_dir, n_samples=int(cfg.get("n_obqa", 500)), seed=seed),
+        }
+        print(f"[r3] Loaded MCQ suites: ARC-C={len(mcq_raw['arc_c'])}, ARC-E={len(mcq_raw['arc_e'])}, OBQA={len(mcq_raw['obqa'])}", flush=True)
+
+        model_specs = cfg["models"]
+        plan = [
+            {"phase": "setup", "of": 1, "unit": "env"},
+            {"phase": "download", "of": 1, "unit": "assets"},
+        ]
+        for mk in model_specs:
+            plan.extend(
+                [
+                    {"phase": f"{mk}_verify", "of": 1, "unit": "check"},
+                    {"phase": f"{mk}_calib", "of": 4, "unit": "steps"},
+                    {"phase": f"{mk}_eval", "of": 22, "unit": "conds"},
+                    {"phase": f"{mk}_speed", "of": 1, "unit": "bench"},
+                    {"phase": f"{mk}_quant_ortho", "of": 2, "unit": "conds"},
+                ]
+            )
+        plan.append({"phase": "report", "of": 1, "unit": "file"})
+        orx.plan(plan)
+        run_obj = orx.progress(total=1, unit="run")
+
+        all_out: dict[str, Any] = {
+            "gpu_index": gpu_idx,
+            "gpu_name": gpu_status.name,
+            "models": {},
+        }
         for mk, mspec in model_specs.items():
             all_out["models"][mk] = run_model_r3(
                 mk,
@@ -1750,6 +1755,8 @@ def main() -> None:
                     if sr["shape"] == "fast_decode_B1_L1" and sr["schedule"] == "cut50_loopsched_iter_greedy":
                         summary_m[f"{mk}_cut50_fast_decode_b1_speedup"] = sr["speedup"]
             pr.step(1, **summary_m)
+    finally:
+        gpu_lock.release()
 
 
 if __name__ == "__main__":
