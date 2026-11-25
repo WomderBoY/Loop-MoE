@@ -1,10 +1,30 @@
 """Check persistent versus scratch lifetime without CUDA or model inference."""
 import unittest
 import torch
-from loop_research.load_once_offload import SlotPlan,legacy_runtime,compare_logits,require_same_execution
+from types import SimpleNamespace
+from loop_research.load_once_offload import SlotPlan,legacy_runtime,compare_logits,require_same_execution,incremental_nll
 
 
 class TestSlots(unittest.TestCase):
+    def test_incremental_nll_target_alignment(self):
+        class Engine:
+            def reset(self):self.position=-1;self.inputs=[]
+            def forward_step(self,ids,moe_executor=None):
+                self.inputs.append(ids.tolist())
+                self.position+=ids.shape[1]
+                logits=torch.zeros(1,ids.shape[1],5)
+                logits[0,-1,(self.position+1)%5]=2
+                return logits
+        engine=Engine();steps=[]
+        route=SimpleNamespace(reset=lambda:None)
+        executor=SimpleNamespace(execute_moe=None)
+        rows=incremental_nll(engine,executor,route,[dict(tokens=[0,1,2,3,4,0,1,2],domain="text")],
+            4,3,torch.device("cpu"),SimpleNamespace(step=steps.append),10)
+        expected=float(torch.log(torch.exp(torch.tensor(2.))+4)-2)
+        self.assertAlmostEqual(rows[0]["nll"],expected,places=6)
+        self.assertEqual(engine.inputs,[[[0,1,2,3]],[[4]],[[0]]])
+        self.assertEqual(steps,[11])
+
     def test_executor_check_is_strict_within_matched_path(self):
         a=torch.tensor([2.,1.,0.]);routes=[[0,1],[1,2]]
         require_same_execution(a,a.clone(),routes,routes)
