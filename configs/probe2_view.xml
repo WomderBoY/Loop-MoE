@@ -1,0 +1,21 @@
+<signal name="stage" label="Stage" />
+<signal name="drop2_renorm_dnll" label="Drop-2nd ΔNLL" digits="4" better="lower" sign="true" />
+<signal name="skip_moe_dnll" label="Skip-MoE ΔNLL" digits="4" better="lower" sign="true" />
+<signal name="policy" label="Policy" />
+<signal name="cut_pct" label="Active Cut" digits="1" unit="%" />
+<signal name="prune_pct" label="Pruned" digits="1" unit="%" />
+<signal name="delta_nll" label="ΔNLL vs Base" digits="4" better="lower" sign="true" />
+<signal name="arc_acc" label="ARC-150 Acc" digits="1" scale="100" unit="%" better="higher" />
+<signal name="ouro_moe_skip35_loop_vs_unif" label="Ouro Skip35 Loop vs Unif" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_skip35_loop_vs_unif" label="Huginn Skip35 Loop vs Unif" digits="4" better="higher" sign="true" />
+<signal name="ouro_moe_prune35_sens_vs_freq" label="Ouro Prune35 Sens vs Freq" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_prune35_sens_vs_freq" label="Huginn Prune35 Sens vs Freq" digits="4" better="higher" sign="true" />
+<view headline="huginn_moe_skip35_loop_vs_unif ouro_moe_skip35_loop_vs_unif huginn_moe_prune35_sens_vs_freq">
+  <stats of="ouro_moe_skip35_loop_vs_unif huginn_moe_skip35_loop_vs_unif ouro_moe_prune35_sens_vs_freq huginn_moe_prune35_sens_vs_freq" vs="final" />
+  <table name="ouro_moe_stages" columns="stage drop2_renorm_dnll skip_moe_dnll" title="Ouro-MoE Per-Stage Redundancy" />
+  <table name="huginn_moe_stages" columns="stage drop2_renorm_dnll skip_moe_dnll" title="Huginn-MoE Per-Stage Redundancy" />
+  <table name="ouro_moe_skip" columns="policy cut_pct delta_nll arc_acc" title="Ouro-MoE Dynamic Skipping" />
+  <table name="huginn_moe_skip" columns="policy cut_pct delta_nll arc_acc" title="Huginn-MoE Dynamic Skipping" />
+  <table name="ouro_moe_prune" columns="policy prune_pct delta_nll arc_acc" title="Ouro-MoE Static Pruning" />
+  <table name="huginn_moe_prune" columns="policy prune_pct delta_nll arc_acc" title="Huginn-MoE Static Pruning" />
+</view>

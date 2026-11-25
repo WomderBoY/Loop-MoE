@@ -73,6 +73,14 @@ elif [[ "$IDEA" == "new_dir2_vsubmoe" ]]; then
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "probe2_loopmoe_skip_prune" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_probe2_skip_prune.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.probe2_loopmoe_skip_prune \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1

@@ -1,38 +1,24 @@
 {
-  "idea": "new_dir2_vsubmoe",
-  "assets": ["ifm_ouro", "ifm_huginn", "datasets", "arc_challenge"],
+  "idea": "probe2_loopmoe_skip_prune",
+  "assets": [
+    "ifm_ouro",
+    "ifm_huginn",
+    "datasets",
+    "arc_challenge"
+  ],
   "need_xllm": true,
-  "preferred_gpu": 5,
-  "seed": 20261124,
-  "seq_len": 320,
-  "n_calib_a": 16,
-  "n_calib_b": 16,
-  "n_adapt_train": 64,
-  "n_eval_heldout": 32,
-  "n_arc_eval": 100,
-  "adapt_lr": 0.0003,
-  "adapt_grad_accum": 2,
-  "lora_alpha": 6.0,
-  "loop_dropout_p": 0.5,
-  "vsubmoe_ld_p": 0.35,
+  "preferred_gpu": null,
+  "seed": 20261126,
+  "seq_len": 256,
+  "n_calib": 16,
+  "n_eval": 32,
+  "n_arc": 150,
   "models": {
     "ouro_moe": {
-      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b",
-      "tracked_layers": [2, 7, 12, 17, 22, 26],
-      "n_loops": 4,
-      "eval_depths": [2, 4, 6, 8],
-      "arc_depths": [4, 6],
-      "k_per_layer": 5,
-      "rank_per_loop": 5
+      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b"
     },
     "huginn_moe": {
-      "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b",
-      "tracked_layers": [9, 12, 15, 18],
-      "n_loops": 8,
-      "eval_depths": [4, 8, 12, 16],
-      "arc_depths": [8, 12],
-      "k_per_layer": 5,
-      "rank_per_loop": 5
+      "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b"
     }
   }
 }

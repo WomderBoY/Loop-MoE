@@ -1,0 +1,8 @@
+{
+  "brief": {
+    "question": "Which loops/stages in IFM Ouro-MoE and Huginn-MoE have redundant 2nd experts or skippable MoE, does loop-aware skipping/pruning beat non-looped baselines, and what is the integer depth profile R=1..16?",
+    "healthy": "Exactness passes with 0.0 diff; sweeps complete in ~18-22 min across both models.",
+    "noise": "Waiting briefly for an idle GPU on shared server is expected.",
+    "worth_a_flag": "Any exactness failure, NaN NLL, or OOM."
+  }
+}
