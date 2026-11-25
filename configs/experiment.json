@@ -37,5 +37,7 @@
   "prompt_tokens": 96,
   "decode_tokens": 32,
   "repeats": 3,
-  "tau": 0.5
+  "tau": 0.5,
+  "diagnostic_only": true,
+  "diagnostic_steps": 8
 }

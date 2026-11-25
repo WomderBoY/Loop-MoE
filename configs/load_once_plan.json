@@ -16,24 +16,9 @@
       "unit": "sequences"
     },
     {
-      "phase": "verify",
-      "of": 3,
-      "unit": "policies"
-    },
-    {
-      "phase": "resident_reference",
-      "of": 48,
-      "unit": "requests"
-    },
-    {
-      "phase": "pack_cpu",
-      "of": 1,
-      "unit": "stores"
-    },
-    {
-      "phase": "offload_3.99",
-      "of": 144,
-      "unit": "requests"
+      "phase": "diagnose",
+      "of": 24,
+      "unit": "steps"
     },
     {
       "phase": "report",
@@ -43,11 +28,10 @@
   ],
   "rules": [],
   "brief": {
-    "question": "Does tau=0.5 Load Once reduce measured free-generation TPOT beyond exact static-hot and the matched hot-only routing control?",
-    "healthy": "Per-visit KV verification and full-resident/offload greedy tokens must match. All expert weights are removed from GPU before physical-cache timing. Three interleaved repetitions per request.",
-    "noise": "Prefix streaming and cache preloading are excluded from TPOT but TTFT is saved separately. Full-resident references are not interleaved and cannot establish a paired latency advantage.",
-    "worth_a_flag": "Foreign GPU process, physical budget overflow, executor mismatch, offload changed tokens, nonfinite latency or zero copies on native static.",
-    "from_parent": "Ouro at 3.99GiB tau=0.5: test NLL penalty 0.01517 and logical copies 56.40 to 33.68. Same-budget hot-only copies 35.37. These are not measured latency gains.",
-    "decided": "No compensation training in this run. Seek >5 percent repeatable TPOT reduction, then judge incremental value beyond hot-only."
+    "question": "Locate native/direct expert versus full-prefix/incremental KV disagreement before any latency experiment.",
+    "healthy": "Four paths use exactly the same growing prefix. Emit max and mean logit difference, KL, top-1 agreement and routing agreement for all four comparisons. No CPU offload or TPOT timing.",
+    "noise": "Nonzero full-prefix versus KV differences are observations, not pass/fail. Earlier B1 already showed BF16 path divergence. This run does not relax or apply the previous 0.25 gate.",
+    "worth_a_flag": "Missing diagnostic comparisons, nonfinite logits, wrong number of logical visits, or an unexpected resident_reference/pack_cpu/offload stage.",
+    "decided": "Await user approval before launching because the shared verification failure hit two experiment nodes."
   }
 }
