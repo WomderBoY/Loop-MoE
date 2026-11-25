@@ -1,5 +1,5 @@
 {
-  "idea": "r2a_loopsched_moe",
+  "idea": "r3_loopsched_v2",
   "assets": [
     "ifm_ouro",
     "ifm_huginn",
@@ -12,7 +12,8 @@
   "preferred_gpu": null,
   "seed": 20261126,
   "seq_len": 256,
-  "n_calib": 16,
+  "n_calib_a": 16,
+  "n_calib_b": 8,
   "n_eval": 64,
   "n_arc_c": 0,
   "n_arc_e": 600,
