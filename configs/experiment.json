@@ -2,7 +2,6 @@
   "idea": "load_once_pilot",
   "assets": [
     "ifm_ouro",
-    "ifm_huginn",
     "datasets",
     "arc_challenge"
   ],
@@ -28,9 +27,6 @@
   "models": {
     "ouro_moe": {
       "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b"
-    },
-    "huginn_moe": {
-      "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b"
     }
   }
 }

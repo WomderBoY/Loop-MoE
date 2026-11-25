@@ -35,41 +35,18 @@
       "unit": "questions"
     },
     {
-      "phase": "huginn_moe_verify",
-      "unit": "checks",
-      "of": 1
-    },
-    {
-      "phase": "huginn_moe_calibrate",
-      "unit": "sequences",
-      "of": 16
-    },
-    {
-      "phase": "huginn_moe_validate",
-      "unit": "sequences",
-      "of": 480
-    },
-    {
-      "phase": "huginn_moe_test",
-      "unit": "sequences",
-      "of": 1280
-    },
-    {
-      "phase": "huginn_moe_arc",
-      "unit": "questions"
-    },
-    {
       "phase": "report",
       "of": 1,
       "unit": "files"
     }
   ],
   "brief": {
-    "question": "At equal expert cache bytes, does retaining each token first-visit experts reduce logical transfers with tolerable NLL loss, beyond a larger hot-only pool?",
+    "question": "Ouro-MoE: test the fixed-budget Load Once quality-transfer tradeoff, concurrently with the Huginn sibling.",
     "healthy": "Native replacement verification must pass; all 20 fixed conditions are evaluated. Validation alone selects policies for ARC.",
     "noise": "Hard route restrictions can greatly increase NLL; this is a scientific result, not a crash. These are full-resident quality experiments; logical copies are not latency.",
     "worth_a_flag": "Nonfinite logits, native verification failure, fewer than two admissible experts, no idle GPU, or missing output. No model training occurs in this stage.",
     "from_parent": "The parent established pure_shared as the strongest simple adaptation control. Its metrics have different meanings; do not compare inherited NLL improvements to this stage loss penalties.",
     "decided": "No 500-step compensation or TPOT claim until the quality and memory tradeoff has been audited."
-  }
+  },
+  "rules": []
 }
