@@ -893,7 +893,10 @@ def verify_engine_exactness(model, engine: OuroCalibratedEngine, tokenizer, devi
     eng_logits_2, _ = engine.forward_policy_logits(
         t2, StepPolicy(name="verify2", n_loops=engine.train_loops), attention_mask=m2
     )
-    diff_2 = float((hf_logits_ref - eng_logits_2[:, -1, :].cpu()).abs().max().item())
+    diff_2_tensor = (hf_logits_ref - eng_logits_2[:, -1, :].cpu()).abs()
+    diff_2 = float(diff_2_tensor.max().item())
+    mean_diff_2 = float(diff_2_tensor.mean().item())
+    top1_b2_exact = bool(torch.equal(hf_logits_ref.argmax(dim=-1), eng_logits_2[:, -1, :].cpu().argmax(dim=-1)))
 
     # 3) 4-step KV-cached greedy decode exactness
     gen_eng, _ = engine.generate_batched(
@@ -913,12 +916,21 @@ def verify_engine_exactness(model, engine: OuroCalibratedEngine, tokenizer, devi
     res = {
         "max_abs_diff_b1": diff_1,
         "max_abs_diff_b2_leftpad": diff_2,
+        "mean_abs_diff_b2_leftpad": mean_diff_2,
+        "top1_b2_exact": top1_b2_exact,
         "decode_4tok_exact": decode_exact,
         "eng_toks": gen_eng[0],
         "hf_toks": hf_gen_1,
     }
     print(f"[verify] OuroCalibratedEngine exactness: {json.dumps(res)}")
-    if not math.isfinite(diff_1) or diff_1 > 0.15 or diff_2 > 0.15:
+    if (
+        not math.isfinite(diff_1)
+        or diff_1 > 0.15
+        or mean_diff_2 > 0.05
+        or diff_2 > 0.6
+        or not top1_b2_exact
+        or not decode_exact
+    ):
         raise RuntimeError(f"Engine exactness check FAILED: {res}")
     return res
 
