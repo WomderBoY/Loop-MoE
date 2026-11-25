@@ -1,5 +1,5 @@
 {
-  "idea": "load_once_offload",
+  "idea": "load_once_replay",
   "assets": [
     "ifm_ouro",
     "datasets",
@@ -33,10 +33,10 @@
   "bench_budgets_gib": [
     3.99
   ],
-  "bench_requests": 8,
+  "bench_requests": 4,
   "prompt_tokens": 96,
-  "decode_tokens": 32,
-  "repeats": 3,
+  "decode_tokens": 24,
+  "repeats": 2,
   "tau": 0.5,
   "diagnostic_only": false,
   "diagnostic_steps": 8,

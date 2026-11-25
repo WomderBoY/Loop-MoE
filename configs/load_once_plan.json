@@ -16,18 +16,8 @@
       "unit": "sequences"
     },
     {
-      "phase": "verify",
-      "of": 6,
-      "unit": "checks"
-    },
-    {
-      "phase": "incremental_quality",
-      "of": 96,
-      "unit": "sequences"
-    },
-    {
-      "phase": "resident_reference",
-      "of": 48,
+      "phase": "record_causal_routes",
+      "of": 24,
       "unit": "requests"
     },
     {
@@ -36,8 +26,13 @@
       "unit": "stores"
     },
     {
-      "phase": "offload_3.99",
-      "of": 144,
+      "phase": "warmup",
+      "of": 6,
+      "unit": "requests"
+    },
+    {
+      "phase": "offload_ceiling",
+      "of": 96,
       "unit": "requests"
     },
     {
@@ -48,11 +43,11 @@
   ],
   "rules": [],
   "brief": {
-    "question": "Ouro: actual offload latency at tau=0.5 and 3.99GiB, with quality evaluated on the same incremental KV path.",
-    "healthy": "Native KV and direct KV executor logits and routes must match exactly. Offloaded and resident predictions must also match. Quality is evaluated before timings on 32 sequences x16 target tokens per condition.",
-    "noise": "Full-prefix versus KV differences are a known separate observation, not caused by the direct expert executor in the diagnostic. Do not compare incremental NLL with first-stage full-prefix NLL as the same metric.",
-    "worth_a_flag": "Native/direct KV mismatch, offload changed tokens, nonfinite logits/timing, foreign GPU process, or physical budget overflow.",
-    "from_parent": "Four-path diagnostic: same-context MoE executor comparisons were exactly zero at all 24 tested points. Full-prefix vs KV differences reached max logit gap 2.046875; 24/24 top-1 agreement in the short diagnostic.",
-    "decided": "User authorized diagnosis followed by continued experiments in msg_237c54db. Continue with corrected same-path verification; this is not a relaxation of its tolerance."
+    "question": "Is any useful hardware speedup possible if online routing decisions are removed, keeping physical copies and expert compute?",
+    "healthy": "Each online and replay output must match its same-policy causal full-resident reference. One shared expert pool at 3.99GiB, including first-visit retention and scratch. Compare replay candidates with replay static, not with online static.",
+    "noise": "Replay uses recorded routing decisions and is not an online method or an achievable deployment speedup. Full-resident tape recording times are not benchmark numbers. No compensation training or new quality tuning occurs.",
+    "worth_a_flag": "Tape mismatch, token mismatch, foreign GPU process or budget overflow. There are 96 timed requests total and 24 recording requests.",
+    "from_parent": "Parent live Load Once was 188.98ms/token vs exact static 151.05ms/token on Ouro. This is one bounded controller-overhead ceiling check before stopping or optimizing.",
+    "decided": "Stop this scheduling line if removing the controller still gives less than 5 percent useful matched-static headroom, or no meaningful incremental value over hot-only."
   }
 }

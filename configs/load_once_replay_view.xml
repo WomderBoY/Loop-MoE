@@ -1,0 +1,2 @@
+<signal name="tpot_live" label="Latest case TPOT" unit="ms/token" digits="2" better="lower" />
+<view headline="tpot_live"><stats of="tpot_live" /><text>Controller ceiling test. Compare replay with replay at the same expert budget. Recorded decisions remove online routing work and are not a deployable speedup. Free generation is primary; matched-input replay is secondary.</text></view>
