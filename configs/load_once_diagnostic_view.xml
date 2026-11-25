@@ -1,0 +1,9 @@
+<signal name="top1_match" label="Current path top-1 agreement" labels='{"1":"same token","0":"different token"}' better="higher" />
+<signal name="max_abs" label="Max logit difference" digits="5" better="lower" />
+<signal name="mean_abs" label="Mean logit difference" digits="5" better="lower" />
+<signal name="kl" label="KL divergence" digits="6" better="lower" />
+<signal name="route_match" label="Route agreement" scale="100" unit="%" digits="2" better="higher" />
+<view headline="top1_match">
+  <table name="diagnostics" columns="policy comparison top1_match max_abs mean_abs kl route_match" />
+  <text>Diagnostic only: native/direct expert execution crossed with full-prefix/incremental KV. Records differences without relaxing a tolerance or claiming latency results.</text>
+</view>

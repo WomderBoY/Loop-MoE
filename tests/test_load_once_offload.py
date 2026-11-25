@@ -1,9 +1,22 @@
 """Check persistent versus scratch lifetime without CUDA or model inference."""
 import unittest
-from loop_research.load_once_offload import SlotPlan,legacy_runtime
+import torch
+from loop_research.load_once_offload import SlotPlan,legacy_runtime,compare_logits
 
 
 class TestSlots(unittest.TestCase):
+    def test_diagnostics_separate_logits_from_decisions(self):
+        a=torch.tensor([2.,1.,0.])
+        same=compare_logits(a,a)
+        self.assertEqual(same["max_abs"],0)
+        self.assertEqual(same["top1_match"],1)
+        offset=compare_logits(a,a+.5)
+        self.assertEqual(offset["max_abs"],.5)
+        self.assertEqual(offset["top1_match"],1)
+        self.assertAlmostEqual(offset["kl"],0,places=6)
+        flipped=compare_logits(a,torch.tensor([0.,3.,0.]))
+        self.assertEqual(flipped["top1_match"],0)
+
     def test_archived_runtime_imports(self):
         self.assertEqual([c.__name__ for c in legacy_runtime()],
                          ["LoopedIncrementalEngine","FastPinnedExpertStore","FullResidentFastExecutor"])

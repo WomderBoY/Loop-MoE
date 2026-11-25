@@ -190,6 +190,90 @@ def verify_engine(model,engine,executor,route,prompt,device):
     print("ENGINE_VERIFY",json.dumps(dict(max_logit_gaps=gaps,greedy_exact=True)),flush=True)
 
 
+def compare_logits(reference,candidate):
+    """Describe numerical and decision differences without declaring equivalence."""
+    ref,got=reference.float(),candidate.float()
+    if ref.shape!=got.shape:raise ValueError("Logit shape mismatch")
+    if not bool(torch.isfinite(ref).all() and torch.isfinite(got).all()):
+        raise RuntimeError("Nonfinite diagnostic logits")
+    diff=(ref-got).abs()
+    lp,lq=F.log_softmax(ref,-1),F.log_softmax(got,-1)
+    rt,ct=int(ref.argmax()),int(got.argmax())
+    k=min(5,ref.numel())
+    top_ref=set(ref.topk(k).indices.tolist())
+    top_got=set(got.topk(k).indices.tolist())
+    return dict(max_abs=float(diff.max()),mean_abs=float(diff.mean()),
+                relative_l2=float((ref-got).norm()/ref.norm().clamp_min(1e-12)),
+                kl=float((lp.exp()*(lp-lq)).sum()),
+                ref_top1=rt,candidate_top1=ct,top1_match=int(rt==ct),
+                top5_overlap=len(top_ref&top_got)/k,
+                ref_token_logprob_delta=float(lq[rt]-lp[rt]))
+
+
+@torch.inference_mode()
+def diagnose_paths(model,Engine,full,shape,configs,prompt,steps,device,out):
+    """Four paths on exactly the same growing prefix, before any CPU offload.
+
+    A: official full prefix + native MoE; B: KV + native MoE;
+    C: fresh full prefix + direct expert executor; D: KV + direct executor.
+    Compare B-D separately from A-B so cache/precision differences cannot be
+    attributed to the expert executor. Teacher tokens always come from A.
+    This function produces diagnostics only and never authorizes timing.
+    """
+    policies=("native","hot_late","load_once")
+    rows=[]
+    progress=orx.progress(phase="diagnose",total=steps*len(policies),unit="steps")
+    done=0
+    for policy in policies:
+        c=next(c for c in configs if c["policy"]==policy)
+        route=Routing(model,c["hot"],policy,.5,False)
+        kv_native,kv_direct,fresh=Engine(model,shape),Engine(model,shape),Engine(model,shape)
+        growing=list(prompt[:16])
+        captured=[]
+        handles=[]
+        def capture(_mod,_args,output):captured.append(output[1][0,-1].tolist())
+        for layer in model.layers:handles.append(layer.moe.router.register_forward_hook(capture))
+        try:
+            with route.attached():
+                for step in range(steps):
+                    logits={}
+                    routes={}
+                    route.reset();captured.clear()
+                    logits["A_full_native"]=model(torch.tensor([growing],device=device),multi_segments=False,cache=None)[0][0,-1].float()
+                    routes["A_full_native"]=list(captured)
+                    for key,engine,executor in [("B_kv_native",kv_native,None),("C_full_direct",fresh,full.execute_moe),("D_kv_direct",kv_direct,full.execute_moe)]:
+                        route.reset();captured.clear()
+                        if key=="C_full_direct":engine.reset()
+                        inp=growing if step==0 or key=="C_full_direct" else [growing[-1]]
+                        logits[key]=engine.forward_step(torch.tensor([inp],device=device),moe_executor=executor)[0,-1].float()
+                        routes[key]=list(captured)
+                    pairs=[("A_full_native","B_kv_native"),("A_full_native","C_full_direct"),
+                           ("B_kv_native","D_kv_direct"),("C_full_direct","D_kv_direct")]
+                    for a,b in pairs:
+                        ra,rb=routes[a],routes[b]
+                        if len(ra)!=len(rb):raise RuntimeError("Diagnostic visit count mismatch")
+                        differing=[i for i,(x,y) in enumerate(zip(ra,rb)) if x!=y]
+                        row=dict(policy=policy,budget=c["budget"],step=step,comparison=a+"__"+b,
+                                 route_match=1-len(differing)/max(len(ra),1),
+                                 first_different_visit=differing[0] if differing else None,
+                                 **compare_logits(logits[a],logits[b]))
+                        rows.append(row)
+                        print("PATH_DIAGNOSTIC",json.dumps(row),flush=True)
+                        progress.row("diagnostics",policy=policy,comparison=row["comparison"],
+                                     max_abs=row["max_abs"],mean_abs=row["mean_abs"],kl=row["kl"],
+                                     top1_match=row["top1_match"],route_match=row["route_match"])
+                    growing.append(int(logits["A_full_native"].argmax()))
+                    done+=1;progress.step(done)
+        finally:
+            for h in handles:h.remove()
+        progress.flush()
+    progress=orx.progress(phase="report",total=1,unit="files")
+    (out/"path-diagnostics.json").write_text(json.dumps(dict(rows=rows,
+        conclusion="Diagnostics only. No latency measurement or equivalence claim."),indent=2))
+    print("DIAGNOSTIC_COMPLETE",json.dumps(dict(rows=len(rows),timing_started=False)),flush=True)
+    progress.step(1);progress.flush()
+
+
 def assert_own_gpu(idx):
     gpu=next(g for g in query_gpus() if g.index==idx)
     foreign=set(gpu.active_pids)-{os.getpid()}
@@ -230,6 +314,10 @@ def benchmark(cfg,args,device,idx):
                                 transient=transient,key=f"{budget:g}_{policy}"))
     engine=Engine(model,shape)
     full=Full(model)
+    if cfg.get("diagnostic_only",False):
+        diagnose_paths(model,Engine,full,shape,configs,prompts[0],
+                       cfg.get("diagnostic_steps",8),device,out)
+        return
     p=orx.progress(phase="verify",total=3,unit="policies")
     for i,policy in enumerate(policies):
         c=next(c for c in configs if c["policy"]==policy)
