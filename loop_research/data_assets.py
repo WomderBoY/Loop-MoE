@@ -78,6 +78,20 @@ MODELSCOPE_MODEL_REPOS: dict[str, tuple[str, list[str]]] = {
             "model.safetensors",
         ],
     ),
+    "ouro14b_thinking": (
+        "bytedance-community/Ouro-1.4B-Thinking",
+        [
+            "config.json",
+            "configuration_ouro.py",
+            "modeling_ouro.py",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "vocab.json",
+            "model.safetensors",
+        ],
+    ),
 }
 
 
@@ -277,28 +291,45 @@ def normalize_math_answer(ans: str) -> str:
 
 
 def extract_predicted_math_answer(text: str, *, mode: str = "gsm8k") -> str:
-    """Extract final predicted math answer from model completion."""
-    boxed = extract_boxed(text)
-    if boxed is not None:
-        return normalize_math_answer(boxed)
-    m = re.search(r"####\s*([-+]?[\d,]+(?:\.\d+)?)", text)
-    if m:
-        return normalize_math_answer(m.group(1))
-    # Search after </think> if present
-    tail = text.split("</think>")[-1] if "</think>" in text else text
+    """Extract final predicted math answer from model completion.
+
+    Preserves </think> boundary when raw special tokens are present so answers
+    after </think> always take precedence over intermediate scratchpad numbers.
+    """
+    # Prefer the post-</think> answer region if a closing think tag is present
+    has_think_end = "</think>" in text
+    tail_raw = text.split("</think>")[-1] if has_think_end else text
+    # Strip chat/special control markers from the tail before regex extraction
+    tail = re.sub(r"<\|(?:im_end|im_start|endoftext)\|>", "", tail_raw)
+    tail = tail.replace("<think>", "").replace("</think>", "").strip()
+    full_clean = re.sub(r"<\|(?:im_end|im_start|endoftext)\|>", "", text)
+    full_clean = full_clean.replace("<think>", "").replace("</think>", "").strip()
+
+    # 1) Prioritize \boxed{...} after </think>, then anywhere in completion
     boxed_tail = extract_boxed(tail)
     if boxed_tail is not None:
         return normalize_math_answer(boxed_tail)
+    boxed_full = extract_boxed(full_clean)
+    if boxed_full is not None:
+        return normalize_math_answer(boxed_full)
+
+    # 2) Check GSM8K "#### <num>" format (tail first, then full)
+    for src in (tail, full_clean):
+        m = re.search(r"####\s*([-+]?[\d,]+(?:\.\d+)?)", src)
+        if m:
+            return normalize_math_answer(m.group(1))
+
+    # 3) Fallback heuristics on the clean post-</think> tail
+    search_src = tail if tail else full_clean
     if mode == "gsm8k":
-        nums = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", tail)
+        nums = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", search_src)
         if nums:
             return normalize_math_answer(nums[-1])
     else:
-        # Look for "answer is ..." or last line
-        m_ans = re.search(r"(?:answer|result)\s*(?:is|=|:)\s*([^\n.]+)", tail, flags=re.IGNORECASE)
+        m_ans = re.search(r"(?:answer|result)\s*(?:is|=|:)\s*([^\n.]+)", search_src, flags=re.IGNORECASE)
         if m_ans:
             return normalize_math_answer(m_ans.group(1))
-        nums = re.findall(r"[-+]?\d[\d,]*(?:/\d+|\.\d+)?", tail)
+        nums = re.findall(r"[-+]?\d[\d,]*(?:/\d+|\.\d+)?", search_src)
         if nums:
             return normalize_math_answer(nums[-1])
     return ""

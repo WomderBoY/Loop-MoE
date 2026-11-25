@@ -72,6 +72,12 @@ elif [[ "$IDEA" == "new_dir1_ftrs" ]]; then
     --model-dir "$MODEL_DIR" \
     --dataset-dir "$DATASET_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "route1_tcre_ragged" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.route1_tcre_ragged \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1
