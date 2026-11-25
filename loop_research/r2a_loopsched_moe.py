@@ -898,7 +898,12 @@ def run_model_r2a(
     calib_seqs = splits["calib_a"]
     eval_seqs = splits["eval_heldout"]
     mcq_enc = {k: prepare_mcq_encoded(v, tokenizer) for k, v in mcq_raw.items()}
-    pad_id = int(getattr(tokenizer, "pad_id", 0) or 0)
+    raw_pad = getattr(tokenizer, "pad_id", None)
+    if raw_pad is None or int(raw_pad) < 0:
+        raw_pad = getattr(tokenizer, "eos_id", None)
+    if raw_pad is None or int(raw_pad) < 0:
+        raw_pad = getattr(tokenizer, "bos_id", 0)
+    pad_id = max(0, int(raw_pad))
 
     # 1) Verify exactness of real dispatcher AND right-padded batching
     with run_obj.phase(f"{model_key}_verify", total=1, unit="check") as pv:
