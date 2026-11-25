@@ -51,20 +51,23 @@ from loop_research.gpu_utils import acquire_idle_gpu
 # ---------------------------------------------------------------------------
 
 def compute_distribution_stats(z: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Compute FP32 softmax distribution, entropy, top-2 margin, and argmax from logits [..., V]."""
+    """Compute FP32 softmax distribution, entropy, top-2 margin, top-2 logit gap, and argmax."""
     zf = z.float()
     log_p = F.log_softmax(zf, dim=-1)
     p = log_p.exp()
     entropy = -(p * log_p).sum(dim=-1).clamp_min(0.0)
-    top2 = torch.topk(p, k=2, dim=-1)
-    margin = (top2.values[..., 0] - top2.values[..., 1]).clamp(0.0, 1.0)
-    top1_prob = top2.values[..., 0].clamp(0.0, 1.0)
-    top1_id = top2.indices[..., 0]
+    top2_z = torch.topk(zf, k=2, dim=-1)
+    logit_gap = (top2_z.values[..., 0] - top2_z.values[..., 1]).clamp_min(0.0)
+    top2_p = torch.topk(p, k=2, dim=-1)
+    margin = (top2_p.values[..., 0] - top2_p.values[..., 1]).clamp(0.0, 1.0)
+    top1_prob = top2_p.values[..., 0].clamp(0.0, 1.0)
+    top1_id = top2_z.indices[..., 0]
     return {
         "p": p,
         "log_p": log_p,
         "entropy": entropy,
         "margin": margin,
+        "logit_gap": logit_gap,
         "top1_prob": top1_prob,
         "top1_id": top1_id,
     }
@@ -267,14 +270,11 @@ class Route1Policy:
     cos_gamma: float = 0.5
     delta_h_tol: float = 0.05
     # Dynamic Ragged-KV Early-Exit settings (applied during decode; prefill stays full-depth sink-protected!)
-    exit_mode: str = "none"  # none | ouro_gate | entropy_agree | random
+    exit_mode: str = "none"  # none | ouro_gate | gap_agree | random
     gate_cdf_thresh: float = 1.0
-    exit_h1: float = 0.0
-    exit_m1: float = 1.0
-    exit_h2: float = 0.0
-    exit_js2: float = 0.0
-    exit_h3: float = 0.0
-    exit_js3: float = 0.0
+    exit_gap1: float = 1e9
+    exit_gap2: float = 1e9
+    exit_gap3: float = 1e9
     rand_exit_probs: tuple[float, ...] = ()  # (p_r1, p_r2, p_r3, p_r4) summing to 1.0
     rand_seed: int = 20261125
 
@@ -550,15 +550,14 @@ class OuroRoute1Engine:
         deep_tcre_count = 0
         cos_sum = 0.0
 
-        # Optional calibration trace collection (for Thinking online quantile calibration!)
+        # Optional calibration trace collection (underflow-free top-2 logit gaps + agreement + Ouro gate CDF)
         calib_records: dict[str, list[np.ndarray]] = {
-            "h1": [], "m1": [], "h2": [], "agree12": [], "js12": [],
-            "h3": [], "agree23": [], "js23": [],
+            "gap1": [], "gap2": [], "agree12": [], "gap3": [], "agree23": [],
             "cdf1": [], "cdf2": [], "cdf3": [],
         }
 
         need_all_z_for_readout = policy.readout_mode != "native"
-        need_z_each_loop = (policy.exit_mode == "entropy_agree") or collect_calib_trace
+        need_z_each_loop = (policy.exit_mode == "gap_agree") or collect_calib_trace
 
         for step_idx in range(1, max_new_tokens):
             if bool(finished.all().item()):
@@ -673,26 +672,20 @@ class OuroRoute1Engine:
                     else:
                         cdf_g = torch.zeros((cur_b,), device=self.device, dtype=torch.float32)
                     if ut == 0:
-                        step_cal["h1"] = st_c["entropy"]
-                        step_cal["m1"] = st_c["margin"]
+                        step_cal["gap1"] = st_c["logit_gap"]
                         step_cal["cdf1"] = cdf_g
-                        p_prev_full = st_c["p"]
                         top1_prev_full = st_c["top1_id"]
                     elif ut == 1:
-                        assert p_prev_full is not None and top1_prev_full is not None
-                        step_cal["h2"] = st_c["entropy"]
+                        assert top1_prev_full is not None
+                        step_cal["gap2"] = st_c["logit_gap"]
                         step_cal["agree12"] = (st_c["top1_id"] == top1_prev_full).float()
-                        step_cal["js12"] = compute_js_divergence(p_prev_full, st_c["p"])
                         step_cal["cdf2"] = cdf_g
-                        p_prev_full = st_c["p"]
                         top1_prev_full = st_c["top1_id"]
                     elif ut == 2:
-                        assert p_prev_full is not None and top1_prev_full is not None
-                        step_cal["h3"] = st_c["entropy"]
+                        assert top1_prev_full is not None
+                        step_cal["gap3"] = st_c["logit_gap"]
                         step_cal["agree23"] = (st_c["top1_id"] == top1_prev_full).float()
-                        step_cal["js23"] = compute_js_divergence(p_prev_full, st_c["p"])
                         step_cal["cdf3"] = cdf_g
-                        p_prev_full = st_c["p"]
                         top1_prev_full = st_c["top1_id"]
 
                 # Evaluate Early-Exit Decision (strictly on ut < n_loops - 1)
@@ -709,39 +702,28 @@ class OuroRoute1Engine:
                             cdf_act = 1.0 - rem_prob[act_idx]
                         do_exit_act = cdf_act >= policy.gate_cdf_thresh
 
-                    elif policy.exit_mode == "entropy_agree":
+                    elif policy.exit_mode == "gap_agree":
                         assert z_act is not None
-                        st_a = compute_distribution_stats(z_act)
+                        top2_z = torch.topk(z_act, k=2, dim=-1)
+                        gap_a = top2_z.values[..., 0] - top2_z.values[..., 1]
+                        t1_a = top2_z.indices[..., 0]
                         if ut == 0:
-                            do_exit_act = (st_a["entropy"] <= policy.exit_h1) & (st_a["margin"] >= policy.exit_m1)
+                            do_exit_act = gap_a >= policy.exit_gap1
                             if all_active:
-                                p_prev_full = st_a["p"]
-                                top1_prev_full = st_a["top1_id"]
+                                top1_prev_full = t1_a
                             else:
-                                p_prev_full = torch.zeros((cur_b, self.vocab_size), device=self.device, dtype=torch.float32)
                                 top1_prev_full = torch.zeros((cur_b,), device=self.device, dtype=torch.long)
-                                p_prev_full[act_idx] = st_a["p"]
-                                top1_prev_full[act_idx] = st_a["top1_id"]
+                                top1_prev_full[act_idx] = t1_a
                         else:
-                            assert p_prev_full is not None and top1_prev_full is not None
-                            p_prev_a = p_prev_full if all_active else p_prev_full[act_idx]
+                            assert top1_prev_full is not None
                             t1_prev_a = top1_prev_full if all_active else top1_prev_full[act_idx]
-                            agree_a = st_a["top1_id"] == t1_prev_a
-                            js_a = compute_js_divergence(p_prev_a, st_a["p"])
-                            if ut == 1:
-                                do_exit_act = agree_a & (
-                                    (st_a["entropy"] <= policy.exit_h2) | (js_a <= policy.exit_js2)
-                                )
-                            else:
-                                do_exit_act = agree_a & (
-                                    (st_a["entropy"] <= policy.exit_h3) | (js_a <= policy.exit_js3)
-                                )
+                            agree_a = t1_a == t1_prev_a
+                            thresh = policy.exit_gap2 if ut == 1 else policy.exit_gap3
+                            do_exit_act = agree_a & (gap_a >= thresh)
                             if all_active:
-                                p_prev_full = st_a["p"]
-                                top1_prev_full = st_a["top1_id"]
+                                top1_prev_full = t1_a
                             else:
-                                p_prev_full[act_idx] = st_a["p"]
-                                top1_prev_full[act_idx] = st_a["top1_id"]
+                                top1_prev_full[act_idx] = t1_a
 
                     elif policy.exit_mode == "random":
                         assert rand_targets is not None
@@ -820,7 +802,7 @@ class OuroRoute1Engine:
                             aligned_count += float(r_diag["aligned"].sum().item())
                             reversal_count += float(r_diag["reversing"].sum().item())
 
-            if collect_calib_trace and "h3" in step_cal:
+            if collect_calib_trace and "gap3" in step_cal:
                 unfin_m = ~finished
                 if bool(unfin_m.any().item()):
                     for ck, cv in step_cal.items():
@@ -946,13 +928,10 @@ def verify_engine_exactness(model, engine: OuroRoute1Engine, tokenizer, device: 
         name="v_ee",
         n_loops=engine.train_loops,
         readout_mode="tcre_cos",
-        exit_mode="entropy_agree",
-        exit_h1=0.2,
-        exit_m1=0.8,
-        exit_h2=0.8,
-        exit_js2=0.02,
-        exit_h3=1.2,
-        exit_js3=0.05,
+        exit_mode="gap_agree",
+        exit_gap1=6.0,
+        exit_gap2=3.0,
+        exit_gap3=4.0,
     )
     gen_ee_b2, st_ee_b2 = engine.generate_batched([ids1, ids2], ee_test_pol, max_new_tokens=6, pad_token_id=pad_id)
     gen_ee_b1_0, _ = engine.generate_batched([ids1], ee_test_pol, max_new_tokens=6, pad_token_id=pad_id)
@@ -1137,27 +1116,40 @@ def run_openloop_trajectory_diagnostic(
     }
 
 
-def _simulate_entropy_agree_mean_r(trace: dict[str, np.ndarray], scale: float) -> tuple[float, tuple[float, ...]]:
-    """Simulate R=4 exit depths on calibration trace for a single monotone strictness scalar."""
-    h1, m1 = trace["h1"], trace["m1"]
-    h2, a12, js12 = trace["h2"], trace["agree12"] > 0.5, trace["js12"]
-    h3, a23, js23 = trace["h3"], trace["agree23"] > 0.5, trace["js23"]
+def _quantile_thresholds_from_trace(trace: dict[str, np.ndarray], q: float) -> dict[str, float]:
+    """Map a single monotone quantile parameter q in [0, 1] to exact underflow-free top-2 logit-gap thresholds.
 
-    tau_h1 = 0.35 * scale
-    tau_m1 = max(0.40, 1.0 - 0.50 * tau_h1)
-    tau_h2 = 1.00 * scale
-    tau_js2 = 0.015 * scale
-    tau_h3 = 1.40 * scale
-    tau_js3 = 0.040 * scale
+    Using top-2 logit gap (z_(1) - z_(2)) avoids FP32 softmax entropy underflow ties at 0.0 on
+    high-confidence CoT tokens, guaranteeing smooth calibration across every target budget R.
+    """
+    if q <= 1e-6:
+        return {"exit_gap1": 1e9, "exit_gap2": 1e9, "exit_gap3": 1e9}
+    q_clip = min(max(float(q), 0.0), 1.0)
+    # Bimodal epistemic-pivot reallocation: easy tokens exit at Loop 1-2, while
+    # low-gap uncertain pivot tokens stay strictly in Loop 4 for full refinement + TCRE!
+    q1 = 0.65 * q_clip
+    q3 = 0.50 * q_clip
+    return {
+        "exit_gap1": float(np.quantile(trace["gap1"], 1.0 - q1)),
+        "exit_gap2": float(np.quantile(trace["gap2"], 1.0 - q_clip)),
+        "exit_gap3": float(np.quantile(trace["gap3"], 1.0 - q3)),
+    }
 
-    ex1 = (h1 <= tau_h1) & (m1 >= tau_m1)
-    ex2 = (~ex1) & a12 & ((h2 <= tau_h2) | (js12 <= tau_js2))
-    ex3 = (~ex1) & (~ex2) & a23 & ((h3 <= tau_h3) | (js23 <= tau_js3))
+
+def _simulate_entropy_agree_mean_r(trace: dict[str, np.ndarray], q: float) -> tuple[float, tuple[float, ...], dict[str, float]]:
+    """Simulate R=4 exit depths on calibration trace for quantile parameter q in [0, 1]."""
+    th = _quantile_thresholds_from_trace(trace, q)
+    g1, g2, g3 = trace["gap1"], trace["gap2"], trace["gap3"]
+    a12, a23 = trace["agree12"] > 0.5, trace["agree23"] > 0.5
+
+    ex1 = g1 >= th["exit_gap1"]
+    ex2 = (~ex1) & a12 & (g2 >= th["exit_gap2"])
+    ex3 = (~ex1) & (~ex2) & a23 & (g3 >= th["exit_gap3"])
     ex4 = (~ex1) & (~ex2) & (~ex3)
 
     probs = (float(ex1.mean()), float(ex2.mean()), float(ex3.mean()), float(ex4.mean()))
     mean_r = 1.0 * probs[0] + 2.0 * probs[1] + 3.0 * probs[2] + 4.0 * probs[3]
-    return mean_r, probs
+    return mean_r, probs, th
 
 
 def _simulate_ouro_gate_mean_r(trace: dict[str, np.ndarray], cdf_thresh: float) -> tuple[float, tuple[float, ...]]:
@@ -1197,14 +1189,14 @@ def calibrate_exit_thresholds(
         collect_calib_trace=True,
     )
     trace = stats["calib_trace"]
-    n_tok = int(len(trace["h1"]))
+    n_tok = int(len(trace["gap1"]))
     if n_tok < 32:
         raise RuntimeError(f"Too few calibration tokens collected: {n_tok}")
 
     calibrated: dict[str, Any] = {
         "n_calib_tokens": n_tok,
-        "median_h1": float(np.median(trace["h1"])),
-        "median_h2": float(np.median(trace["h2"])),
+        "median_gap1": float(np.median(trace["gap1"])),
+        "median_gap2": float(np.median(trace["gap2"])),
         "agree12_rate": float(np.mean(trace["agree12"])),
         "agree23_rate": float(np.mean(trace["agree23"])),
         "median_cdf1": float(np.median(trace["cdf1"])),
@@ -1215,28 +1207,22 @@ def calibrate_exit_thresholds(
 
     for r_tgt in target_budgets:
         key = f"{r_tgt:.1f}"
-        # 1) Binary search strictness scale for entropy_agree (larger scale => more exits => smaller mean_r)
-        lo, hi = 0.001, 8.0
+        # 1) Binary search monotone quantile parameter q in [0, 1] (larger q => more exits => smaller mean_r)
+        lo, hi = 0.0, 1.0
         for _ in range(32):
             mid = 0.5 * (lo + hi)
-            mr, _ = _simulate_entropy_agree_mean_r(trace, mid)
+            mr, _, _ = _simulate_entropy_agree_mean_r(trace, mid)
             if mr > r_tgt:
                 lo = mid
             else:
                 hi = mid
-        s_best = 0.5 * (lo + hi)
-        mr_best, probs_best = _simulate_entropy_agree_mean_r(trace, s_best)
-        tau_h1 = 0.35 * s_best
+        q_best = 0.5 * (lo + hi)
+        mr_best, probs_best, th_best = _simulate_entropy_agree_mean_r(trace, q_best)
         calibrated["entropy_agree"][key] = {
-            "scale": s_best,
+            "quantile_q": q_best,
             "calib_mean_r": mr_best,
             "calib_exit_probs": list(probs_best),
-            "exit_h1": tau_h1,
-            "exit_m1": max(0.40, 1.0 - 0.50 * tau_h1),
-            "exit_h2": 1.00 * s_best,
-            "exit_js2": 0.015 * s_best,
-            "exit_h3": 1.40 * s_best,
-            "exit_js3": 0.040 * s_best,
+            **th_best,
         }
 
         # 2) Binary search CDF threshold for ouro_gate (smaller thresh => more exits => smaller mean_r)
@@ -1257,14 +1243,14 @@ def calibrate_exit_thresholds(
         }
 
     print(f"[calib] Collected {n_tok} train rollout tokens: agree12={calibrated['agree12_rate']*100:.1f}%, "
-          f"H1_med={calibrated['median_h1']:.3f}, H2_med={calibrated['median_h2']:.3f}, "
+          f"gap1_med={calibrated['median_gap1']:.2f}, gap2_med={calibrated['median_gap2']:.2f}, "
           f"gate_cdf1_med={calibrated['median_cdf1']:.3f}")
     for r_tgt in target_budgets:
         k = f"{r_tgt:.1f}"
         ea = calibrated["entropy_agree"][k]
         og = calibrated["ouro_gate"][k]
-        print(f"  target R={k}: entropy_agree(scale={ea['scale']:.3f}, calib_R={ea['calib_mean_r']:.2f}, "
-              f"p={[round(x, 2) for x in ea['calib_exit_probs']]}) | "
+        print(f"  target R={k}: gap_agree(q={ea['quantile_q']:.3f}, gap=[{ea['exit_gap1']:.2f},{ea['exit_gap2']:.2f},{ea['exit_gap3']:.2f}], "
+              f"calib_R={ea['calib_mean_r']:.2f}, p={[round(x, 2) for x in ea['calib_exit_probs']]}) | "
               f"ouro_gate(cdf={og['gate_cdf_thresh']:.3f}, calib_R={og['calib_mean_r']:.2f})")
     return calibrated
 
@@ -1482,13 +1468,10 @@ def _build_ea_policy(name: str, cal_ea: dict[str, Any], *, readout_mode: str, om
         n_loops=4,
         readout_mode=readout_mode,
         omega_max=omega_max,
-        exit_mode="entropy_agree",
-        exit_h1=float(cal_ea["exit_h1"]),
-        exit_m1=float(cal_ea["exit_m1"]),
-        exit_h2=float(cal_ea["exit_h2"]),
-        exit_js2=float(cal_ea["exit_js2"]),
-        exit_h3=float(cal_ea["exit_h3"]),
-        exit_js3=float(cal_ea["exit_js3"]),
+        exit_mode="gap_agree",
+        exit_gap1=float(cal_ea["exit_gap1"]),
+        exit_gap2=float(cal_ea["exit_gap2"]),
+        exit_gap3=float(cal_ea["exit_gap3"]),
     )
 
 

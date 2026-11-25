@@ -11,6 +11,7 @@ from loop_research.data_assets import extract_predicted_math_answer
 from loop_research.route1_tcre_ragged import (
     OuroRoute1Engine,
     Route1Policy,
+    _simulate_entropy_agree_mean_r,
     compute_openloop_readout,
     compute_trajectory_consistency,
 )
@@ -179,19 +180,16 @@ def test_ragged_kv_batched_equals_b1_and_skips_loops() -> None:
     p2 = [1, 4, 8]
     p3 = [1, 2, 6, 11, 14]
 
-    for exit_mode in ("none", "entropy_agree", "ouro_gate", "random"):
+    for exit_mode in ("none", "gap_agree", "ouro_gate", "random"):
         pol = Route1Policy(
             name=f"test_{exit_mode}",
             n_loops=4,
             readout_mode="tcre_cos",
             exit_mode=exit_mode,
             gate_cdf_thresh=0.65,
-            exit_h1=3.7,
-            exit_m1=0.01,
-            exit_h2=3.9,
-            exit_js2=0.05,
-            exit_h3=4.0,
-            exit_js3=0.1,
+            exit_gap1=0.35,
+            exit_gap2=0.15,
+            exit_gap3=0.25,
             rand_exit_probs=(0.3, 0.3, 0.2, 0.2),
         )
         gen_b, st_b = eng.generate_batched([p1, p2, p3], pol, max_new_tokens=10, pad_token_id=0)
@@ -204,6 +202,34 @@ def test_ragged_kv_batched_equals_b1_and_skips_loops() -> None:
             assert abs(st_b["mean_loops"] - 4.0) < 1e-6
 
 
+def test_quantile_calibration_sharp_distribution() -> None:
+    """Verify underflow-free logit-gap quantile calibration hits 1.8, 2.2, 2.8 cleanly."""
+    import numpy as np
+    rng = np.random.default_rng(7)
+    n = 2000
+    # High-confidence logit gaps (many > 18 where softmax entropy underflows to 0.0!)
+    gap1 = np.abs(rng.normal(14.0, 8.0, size=n))
+    gap2 = gap1 + np.abs(rng.normal(2.5, 2.0, size=n))
+    gap3 = gap2 + np.abs(rng.normal(1.0, 1.5, size=n))
+    trace = {
+        "gap1": gap1,
+        "gap2": gap2, "agree12": (rng.random(n) < 0.92).astype(np.float32),
+        "gap3": gap3, "agree23": (rng.random(n) < 0.95).astype(np.float32),
+    }
+    for r_tgt, min_p4 in [(1.8, 0.08), (2.2, 0.18), (2.8, 0.35)]:
+        lo, hi = 0.0, 1.0
+        for _ in range(32):
+            mid = 0.5 * (lo + hi)
+            mr, _, _ = _simulate_entropy_agree_mean_r(trace, mid)
+            if mr > r_tgt:
+                lo = mid
+            else:
+                hi = mid
+        mr, probs, _ = _simulate_entropy_agree_mean_r(trace, 0.5 * (lo + hi))
+        assert abs(mr - r_tgt) < 0.05, f"target={r_tgt}, got mr={mr:.3f}, probs={probs}"
+        assert probs[3] >= min_p4, f"target={r_tgt}, too few R=4 tokens: probs={probs}"
+
+
 if __name__ == "__main__":
     test_fisher_cosine_shift_and_scale_invariance()
     test_tcre_period2_oscillation_exact_cancellation()
@@ -211,4 +237,5 @@ if __name__ == "__main__":
     test_tcre_cos_continuity_at_zero()
     test_thinking_special_token_answer_parsing()
     test_ragged_kv_batched_equals_b1_and_skips_loops()
+    test_quantile_calibration_sharp_distribution()
     print("ALL ROUTE 1 CPU UNIT TESTS PASSED!")
