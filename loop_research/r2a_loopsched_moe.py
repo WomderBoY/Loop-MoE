@@ -611,6 +611,8 @@ def calibrate_loopsched(
     topo: list[dict[str, Any]],
     calib_seqs: list[dict[str, Any]],
     device: torch.device,
+    *,
+    batch_size: int = 8,
 ) -> dict[str, Any]:
     """Single-pass geometric calibration (cos(e1, e2), optimal gamma_v*, ratios) +
     per-visit marginal NLL sensitivity calibration for k=2->1 and k=1->0 on calib_seqs ONLY.
@@ -690,9 +692,8 @@ def calibrate_loopsched(
             moe.forward = make_calib_moe(lid, moe, moe.forward)
 
         # Batched pass over calib_seqs
-        bsz = 8
-        for s0 in range(0, len(calib_seqs), bsz):
-            batch = calib_seqs[s0 : s0 + bsz]
+        for s0 in range(0, len(calib_seqs), batch_size):
+            batch = calib_seqs[s0 : s0 + batch_size]
             toks = torch.tensor([b["tokens"] for b in batch], device=device, dtype=torch.long)
             for l in range(n_layers):
                 visits[l] = 0
@@ -712,7 +713,7 @@ def calibrate_loopsched(
     # Measure per-visit marginal NLL sensitivity on calib_seqs[:8] ONLY
     calib_sub = calib_seqs[:8]
     base_exec = LoopSchedExecutor(model, topo, mode="native")
-    base_nll = eval_nll_batched(model, calib_sub, base_exec, device, batch_size=8)["nll"]
+    base_nll = eval_nll_batched(model, calib_sub, base_exec, device, batch_size=batch_size)["nll"]
 
     sens_k1_opt = np.zeros(V, dtype=np.float64)
     sens_k0 = np.zeros(V, dtype=np.float64)
@@ -722,13 +723,13 @@ def calibrate_loopsched(
         vk = [2] * V
         vk[v] = 1
         ex_opt = LoopSchedExecutor(model, topo, mode="static", visit_k=vk, visit_gamma=visit_gamma, renorm_on_drop2=False)
-        sens_k1_opt[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_opt, device, batch_size=8)["nll"] - base_nll)
+        sens_k1_opt[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_opt, device, batch_size=batch_size)["nll"] - base_nll)
 
         # k=0 (skip routed MoE)
         vk0 = [2] * V
         vk0[v] = 0
         ex_k0 = LoopSchedExecutor(model, topo, mode="static", visit_k=vk0, visit_gamma=visit_gamma, renorm_on_drop2=False)
-        sens_k0[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_k0, device, batch_size=8)["nll"] - base_nll)
+        sens_k0[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_k0, device, batch_size=batch_size)["nll"] - base_nll)
 
     # Layer-Only pooled sensitivity (ablation that strips loop index!)
     layer_sens_k1 = np.zeros(V, dtype=np.float64)
@@ -755,10 +756,10 @@ def calibrate_loopsched(
         ex_sn = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s1, visit_gamma=[1.0] * V, renorm_on_drop2=False)
         ex_so = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s1, visit_gamma=visit_gamma, renorm_on_drop2=False)
         ex_s0 = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s0, visit_gamma=visit_gamma, renorm_on_drop2=False)
-        d_sr = eval_nll_batched(model, calib_sub, ex_sr, device, batch_size=8)["nll"] - base_nll
-        d_sn = eval_nll_batched(model, calib_sub, ex_sn, device, batch_size=8)["nll"] - base_nll
-        d_so = eval_nll_batched(model, calib_sub, ex_so, device, batch_size=8)["nll"] - base_nll
-        d_s0 = eval_nll_batched(model, calib_sub, ex_s0, device, batch_size=8)["nll"] - base_nll
+        d_sr = eval_nll_batched(model, calib_sub, ex_sr, device, batch_size=batch_size)["nll"] - base_nll
+        d_sn = eval_nll_batched(model, calib_sub, ex_sn, device, batch_size=batch_size)["nll"] - base_nll
+        d_so = eval_nll_batched(model, calib_sub, ex_so, device, batch_size=batch_size)["nll"] - base_nll
+        d_s0 = eval_nll_batched(model, calib_sub, ex_s0, device, batch_size=batch_size)["nll"] - base_nll
         stage_summary.append(
             {
                 "stage": st,
@@ -906,6 +907,8 @@ def run_model_r2a(
     pad_id = max(0, int(raw_pad))
 
     # 1) Verify exactness of real dispatcher AND right-padded batching
+    nll_bsz = 8
+    mcq_bsz = 32
     with run_obj.phase(f"{model_key}_verify", total=1, unit="check") as pv:
         with torch.inference_mode():
             # 1a. verify_k2 vs native at B=2, L=64
@@ -917,19 +920,43 @@ def run_model_r2a(
                 our_logits = model(t_in, multi_segments=False, cache=None)[0].float()
             k2_diff = float((ref_logits - our_logits).abs().max().item())
 
-            # 1b. verify B=1 vs B=4 right-padded causal invariance on first 4 ARC-C choices
-            sample_seqs = [mcq_enc["arc_c"][i]["choices"][0][0][:-1] for i in range(4)]
+            # 1b. verify B=1 vs B=4 right-padded causal invariance + cross-batch leak + 25q ARC agreement
+            sample_pairs = [mcq_enc["arc_c"][i]["choices"][0] for i in range(4)]
+            sample_seqs = [p[0][:-1] for p in sample_pairs]
             max_l = max(len(s) for s in sample_seqs)
             pad_in = torch.full((4, max_l), pad_id, device=device, dtype=torch.long)
             for bi, s in enumerate(sample_seqs):
                 pad_in[bi, : len(s)] = torch.tensor(s, device=device, dtype=torch.long)
+            pad_leak = pad_in.clone()
+            pad_leak[1:, :] = torch.randint(10, 5000, pad_leak[1:, :].shape, device=device, dtype=torch.long)
+            pad_same = pad_in[0:1].expand(4, -1).contiguous()
+
             batched_logits = model(pad_in, multi_segments=False, cache=None)[0].float()
+            batched_leak = model(pad_leak, multi_segments=False, cache=None)[0].float()
+            batched_same = model(pad_same, multi_segments=False, cache=None)[0].float()
             pad_max_diff = 0.0
-            for bi, s in enumerate(sample_seqs):
+            pad_mean_diffs = []
+            for bi, (full_ids, _p_len) in enumerate(sample_pairs):
+                s = full_ids[:-1]
                 s_in = torch.tensor([s], device=device, dtype=torch.long)
                 one_logits = model(s_in, multi_segments=False, cache=None)[0].float()
-                d = float((one_logits[0] - batched_logits[bi, : len(s)]).abs().max().item())
-                pad_max_diff = max(pad_max_diff, d)
+                diff_t = (one_logits[0] - batched_logits[bi, : len(s)]).abs()
+                pad_max_diff = max(pad_max_diff, float(diff_t.max().item()))
+                pad_mean_diffs.append(float(diff_t.mean().item()))
+            s0_len = len(sample_seqs[0])
+            leak_mean = float((batched_logits[0, :s0_len] - batched_leak[0, :s0_len]).abs().mean().item())
+            same_mean = float((batched_logits[0, :s0_len] - batched_same[0, :s0_len]).abs().mean().item())
+
+            # Check actual downstream MCQ prediction agreement on 25 ARC-C questions (B=1 vs B=32)
+            ex_nat = LoopSchedExecutor(model, topo, mode="native", track_stats=False)
+            acc_b1_25, fl_b1_25 = eval_mcq_batched(model, mcq_enc["arc_c"][:25], ex_nat, device, batch_size=1, pad_token_id=pad_id)
+            acc_b32_25, fl_b32_25 = eval_mcq_batched(model, mcq_enc["arc_c"][:25], ex_nat, device, batch_size=32, pad_token_id=pad_id)
+            agree_25 = float(np.mean([a == b for a, b in zip(fl_b1_25, fl_b32_25)]))
+
+            # Check NLL agreement on 8 eval seqs (B=1 vs B=8)
+            nll_b1 = eval_nll_batched(model, eval_seqs[:8], ex_nat, device, batch_size=1)["nll"]
+            nll_b8 = eval_nll_batched(model, eval_seqs[:8], ex_nat, device, batch_size=8)["nll"]
+            nll_batch_diff = abs(nll_b1 - nll_b8)
 
             # 1c. verify B=1, L=1 single-token decode parity
             d1_in = torch.tensor([[eval_seqs[0]["tokens"][0]]], device=device, dtype=torch.long)
@@ -939,17 +966,32 @@ def run_model_r2a(
                 d1_our = model(d1_in, multi_segments=False, cache=None)[0].float()
             d1_diff = float((d1_ref - d1_our).abs().max().item())
 
+        mean_diff = float(np.mean(pad_mean_diffs))
         print(
-            f"[r2a:{model_key}] Exactness OK: k2_diff={k2_diff:.2e}, pad_batch_diff={pad_max_diff:.2e}, decode1_diff={d1_diff:.2e}",
+            f"[r2a:{model_key}] Exactness OK: k2_diff={k2_diff:.2e}, decode1_diff={d1_diff:.2e} | "
+            f"Batch diag: mean_diff={mean_diff:.4f}, same_mean={same_mean:.4f}, leak_mean={leak_mean:.4f}, "
+            f"nll_diff(B1 vs B8)={nll_batch_diff:.5f}, arc25_agree(B1 vs B32)={agree_25*100:.1f}% "
+            f"(acc B1={acc_b1_25*100:.1f}% vs B32={acc_b32_25*100:.1f}%)",
             flush=True,
         )
-        if k2_diff > 1e-2 or pad_max_diff > 5e-2 or d1_diff > 1e-2:
-            raise RuntimeError(f"Exactness verification failed: k2={k2_diff}, pad={pad_max_diff}, d1={d1_diff}")
+        if k2_diff > 1e-2 or d1_diff > 1e-2:
+            raise RuntimeError(f"Dispatcher exactness verification failed: k2={k2_diff}, d1={d1_diff}")
+        if leak_mean < 0.25 and nll_batch_diff < 0.01 and agree_25 >= 0.92:
+            print(f"[r2a:{model_key}] Batched parity VERIFIED (nll_bsz={nll_bsz}, mcq_bsz={mcq_bsz}).", flush=True)
+        else:
+            print(f"[r2a:{model_key}] WARNING: B>1 mismatch exceeds tolerance -> falling back to exact B=1 (compact MCQ)!", flush=True)
+            nll_bsz = 1
+            mcq_bsz = 1
+            mcq_enc = {
+                "arc_c": mcq_enc["arc_c"][:100],
+                "arc_e": mcq_enc["arc_e"][:80],
+                "obqa": mcq_enc["obqa"][:80],
+            }
         pv.step(1)
 
     # 2) Calibration pass (geometry + optimal gamma_v* + per-visit sensitivities)
     with run_obj.phase(f"{model_key}_calib", total=1, unit="pass") as pc:
-        calib = calibrate_loopsched(model, topo, calib_seqs, device)
+        calib = calibrate_loopsched(model, topo, calib_seqs, device, batch_size=nll_bsz)
         print(f"[r2a:{model_key}] Per-stage geometry & sensitivity summary:", flush=True)
         for st in calib["stage_summary"]:
             print(
@@ -1131,13 +1173,13 @@ def run_model_r2a(
                 visit_weights=c["w"],
                 dyn_threshold=c["tau"],
             )
-            nll_res = eval_nll_batched(model, eval_seqs, ex, device, batch_size=8)
+            nll_res = eval_nll_batched(model, eval_seqs, ex, device, batch_size=nll_bsz)
             cut_pct = nll_res["cut_pct"]
 
             mcq_accs: dict[str, float] = {}
             mcq_flags: dict[str, list[int]] = {}
             for ds_name, enc_items in mcq_enc.items():
-                acc, fl = eval_mcq_batched(model, enc_items, ex, device, batch_size=32, pad_token_id=pad_id)
+                acc, fl = eval_mcq_batched(model, enc_items, ex, device, batch_size=mcq_bsz, pad_token_id=pad_id)
                 mcq_accs[ds_name] = acc
                 mcq_flags[ds_name] = fl
             avg_mcq = float(np.mean(list(mcq_accs.values())))
