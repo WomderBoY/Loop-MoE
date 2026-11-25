@@ -429,18 +429,21 @@ class OuroDepthEngine:
                             top1_prev_full = torch.zeros((bsz,), device=self.device, dtype=torch.long)
                         top1_prev_full[act_idx] = t1_act
 
-                # Calibration recording (only during full fixed R=n_loops pass)
+                # Calibration recording (only during full fixed R=n_loops pass where active == unfinished)
                 if collect_calib and not is_last:
-                    unfin = ~finished
-                    if bool(unfin.any().item()):
-                        if kl_act is not None and loop_num in calib_kl:
-                            calib_kl[loop_num].append(kl_act[unfin].cpu().numpy())
-                        if need_gate and loop_num in calib_gate:
-                            calib_gate[loop_num].append(cdf_acc[unfin].cpu().numpy())
-                        if gap_act is not None and loop_num in calib_gap:
-                            # If loop_num >= 2, require agreement with previous loop (else gap=-1)
-                            eff_gap = torch.where(agree_act, gap_act, torch.full_like(gap_act, -1.0)) if (loop_num >= 2 and agree_act is not None) else gap_act
-                            calib_gap[loop_num].append(eff_gap[unfin].cpu().numpy())
+                    if kl_act is not None and loop_num in calib_kl:
+                        calib_kl[loop_num].append(kl_act.cpu().numpy())
+                    if need_gate and loop_num in calib_gate:
+                        cdf_active = cdf_acc if all_active else cdf_acc[act_idx]
+                        calib_gate[loop_num].append(cdf_active.cpu().numpy())
+                    if gap_act is not None and loop_num in calib_gap:
+                        # If loop_num >= 2, require agreement with previous loop (else gap=-1)
+                        eff_gap = (
+                            torch.where(agree_act, gap_act, torch.full_like(gap_act, -1.0))
+                            if (loop_num >= 2 and agree_act is not None)
+                            else gap_act
+                        )
+                        calib_gap[loop_num].append(eff_gap.cpu().numpy())
 
                 # Decide which undecided rows exit at this loop
                 if not is_last and policy.exit_mode != "fixed":
