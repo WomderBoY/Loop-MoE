@@ -1,5 +1,5 @@
 {
-  "idea": "load_once_pilot",
+  "idea": "load_once_offload",
   "assets": [
     "ifm_ouro",
     "datasets",
@@ -26,7 +26,16 @@
   ],
   "models": {
     "ouro_moe": {
-      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b"
+      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b",
+      "arch": "transformer"
     }
-  }
+  },
+  "bench_budgets_gib": [
+    3.99
+  ],
+  "bench_requests": 8,
+  "prompt_tokens": 96,
+  "decode_tokens": 32,
+  "repeats": 3,
+  "tau": 0.5
 }

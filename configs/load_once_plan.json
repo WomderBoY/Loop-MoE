@@ -11,28 +11,29 @@
       "unit": "assets"
     },
     {
-      "phase": "ouro_moe_verify",
-      "unit": "checks",
-      "of": 1
+      "phase": "calibrate",
+      "of": 16,
+      "unit": "sequences"
     },
     {
-      "phase": "ouro_moe_calibrate",
-      "unit": "sequences",
-      "of": 16
+      "phase": "verify",
+      "of": 3,
+      "unit": "policies"
     },
     {
-      "phase": "ouro_moe_validate",
-      "unit": "sequences",
-      "of": 480
+      "phase": "resident_reference",
+      "of": 48,
+      "unit": "requests"
     },
     {
-      "phase": "ouro_moe_test",
-      "unit": "sequences",
-      "of": 1280
+      "phase": "pack_cpu",
+      "of": 1,
+      "unit": "stores"
     },
     {
-      "phase": "ouro_moe_arc",
-      "unit": "questions"
+      "phase": "offload_3.99",
+      "of": 144,
+      "unit": "requests"
     },
     {
       "phase": "report",
@@ -40,13 +41,13 @@
       "unit": "files"
     }
   ],
+  "rules": [],
   "brief": {
-    "question": "Ouro-MoE: test the fixed-budget Load Once quality-transfer tradeoff, concurrently with the Huginn sibling.",
-    "healthy": "Native replacement verification must pass; all 20 fixed conditions are evaluated. Validation alone selects policies for ARC.",
-    "noise": "Hard route restrictions can greatly increase NLL; this is a scientific result, not a crash. These are full-resident quality experiments; logical copies are not latency.",
-    "worth_a_flag": "Nonfinite logits, native verification failure, fewer than two admissible experts, no idle GPU, or missing output. No model training occurs in this stage.",
-    "from_parent": "The parent established pure_shared as the strongest simple adaptation control. Its metrics have different meanings; do not compare inherited NLL improvements to this stage loss penalties.",
-    "decided": "No 500-step compensation or TPOT claim until the quality and memory tradeoff has been audited."
-  },
-  "rules": []
+    "question": "Does tau=0.5 Load Once reduce measured free-generation TPOT beyond exact static-hot and the matched hot-only routing control?",
+    "healthy": "Per-visit KV verification and full-resident/offload greedy tokens must match. All expert weights are removed from GPU before physical-cache timing. Three interleaved repetitions per request.",
+    "noise": "Prefix streaming and cache preloading are excluded from TPOT but TTFT is saved separately. Full-resident references are not interleaved and cannot establish a paired latency advantage.",
+    "worth_a_flag": "Foreign GPU process, physical budget overflow, executor mismatch, offload changed tokens, nonfinite latency or zero copies on native static.",
+    "from_parent": "Ouro at 3.99GiB tau=0.5: test NLL penalty 0.01517 and logical copies 56.40 to 33.68. Same-budget hot-only copies 35.37. These are not measured latency gains.",
+    "decided": "No compensation training in this run. Seek >5 percent repeatable TPOT reduction, then judge incremental value beyond hot-only."
+  }
 }
