@@ -260,7 +260,7 @@ class LoopMoEIntervention:
                         if self.mode == "dynamic_skip":
                             # Ratio w2/w1 (with weights sorted or unsorted; pick smaller of the two!)
                             w_min, min_pos = w_f.min(dim=-1)
-                            w_max = w_f.max(dim=-1).clamp_min(1e-12)
+                            w_max = w_f.amax(dim=-1).clamp_min(1e-12)
                             ratio = w_min / w_max
 
                             # Optional stage weight & cross-loop stay factor
@@ -399,7 +399,7 @@ def collect_calib_skip_and_prune_stats(
                     sid = stage_id_for(lid_c, v, loop_start, loop_end, n_loops)
                     wf = weights.float()
                     w_min, min_pos = wf.min(dim=-1)
-                    w_max = wf.max(dim=-1).clamp_min(1e-12)
+                    w_max = wf.amax(dim=-1).clamp_min(1e-12)
                     ratio = (w_min / w_max).reshape(-1).cpu().numpy()
                     ratios_by_stage[sid].append(ratio)
 
@@ -418,7 +418,11 @@ def collect_calib_skip_and_prune_stats(
                     y = orig_fn(x, group_sizes)
                     v = visits[lid_c]
                     if v < n_loops:
-                        gs = group_sizes.detach().cpu().tolist()
+                        gs = (
+                            group_sizes.detach().cpu().tolist()
+                            if torch.is_tensor(group_sizes)
+                            else [int(g) for g in group_sizes]
+                        )
                         y_sq = y.float().pow(2).sum(dim=-1)
                         off = 0
                         for e in range(n_experts):
