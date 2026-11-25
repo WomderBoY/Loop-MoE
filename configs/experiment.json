@@ -1,13 +1,12 @@
 {
   "idea": "load_once_pilot",
   "assets": [
-    "ifm_ouro",
     "ifm_huginn",
     "datasets",
     "arc_challenge"
   ],
   "need_xllm": true,
-  "preferred_gpu": 3,
+  "preferred_gpu": 4,
   "seed": 20261125,
   "seq_len": 256,
   "n_calib": 16,
@@ -26,9 +25,6 @@
     1000000000.0
   ],
   "models": {
-    "ouro_moe": {
-      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b"
-    },
     "huginn_moe": {
       "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b"
     }
