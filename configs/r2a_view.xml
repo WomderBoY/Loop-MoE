@@ -1,0 +1,36 @@
+<signal name="policy" label="Policy" />
+<signal name="cut_pct" label="Active Cut" digits="1" unit="%" />
+<signal name="delta_nll" label="ΔNLL vs Base" digits="4" better="lower" sign="true" />
+<signal name="arc_c" label="ARC-C (1172)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="arc_e" label="ARC-E (600)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="obqa" label="OBQA (500)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="avg_mcq" label="Avg MCQ (2272)" digits="1" scale="100" unit="%" better="higher" />
+<signal name="latest_avg_mcq" label="Latest Avg MCQ" digits="1" scale="100" unit="%" better="higher" />
+<signal name="latest_dnll" label="Latest ΔNLL" digits="4" better="lower" sign="true" />
+<signal name="stage" label="Stage" />
+<signal name="cos_e1_e2" label="cos(e1,e2)" digits="3" />
+<signal name="gamma_opt" label="Opt γ*" digits="3" />
+<signal name="k1_renorm" label="k=1 Renorm" digits="4" better="lower" sign="true" />
+<signal name="k1_opt" label="k=1 Opt γ*" digits="4" better="lower" sign="true" />
+<signal name="k0_sens" label="k=0 Skip" digits="4" better="lower" sign="true" />
+<signal name="shape" label="Shape" />
+<signal name="schedule" label="Schedule" />
+<signal name="median_ms" label="Latency" digits="2" unit="ms" better="lower" />
+<signal name="speedup" label="Speedup" digits="3" unit="x" better="higher" />
+<signal name="huginn_moe_cut50_dp_vs_top1_nll" label="Huginn -50% DP vs Top1 NLL Gain" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_cut50_dp_vs_top1_mcq" label="Huginn -50% DP vs Top1 MCQ Gain" digits="2" unit="pp" better="higher" sign="true" />
+<signal name="ouro_moe_cut50_dp_vs_top1_nll" label="Ouro -50% DP vs Top1 NLL Gain" digits="4" better="higher" sign="true" />
+<signal name="ouro_moe_cut50_dp_vs_top1_mcq" label="Ouro -50% DP vs Top1 MCQ Gain" digits="2" unit="pp" better="higher" sign="true" />
+<signal name="ouro_moe_cut38_dyn_vs_layer_nll" label="Ouro -38% Loop vs Layer-Only NLL" digits="4" better="higher" sign="true" />
+<signal name="huginn_moe_cut38_dyn_vs_layer_nll" label="Huginn -38% Loop vs Layer-Only NLL" digits="4" better="higher" sign="true" />
+<signal name="ouro_moe_cut50_decode_b1_speedup" label="Ouro -50% Decode B=1 Speedup" digits="3" unit="x" better="higher" />
+<signal name="huginn_moe_cut50_decode_b1_speedup" label="Huginn -50% Decode B=1 Speedup" digits="3" unit="x" better="higher" />
+<view headline="huginn_moe_cut50_dp_vs_top1_mcq ouro_moe_cut50_dp_vs_top1_mcq latest_avg_mcq">
+  <stats of="ouro_moe_cut50_dp_vs_top1_nll ouro_moe_cut50_dp_vs_top1_mcq huginn_moe_cut50_dp_vs_top1_nll huginn_moe_cut50_dp_vs_top1_mcq ouro_moe_cut38_dyn_vs_layer_nll huginn_moe_cut38_dyn_vs_layer_nll ouro_moe_cut50_decode_b1_speedup huginn_moe_cut50_decode_b1_speedup" vs="final" />
+  <table name="ouro_moe_results" columns="policy cut_pct delta_nll arc_c arc_e obqa avg_mcq" title="Ouro-MoE LoopSched Results" />
+  <table name="huginn_moe_results" columns="policy cut_pct delta_nll arc_c arc_e obqa avg_mcq" title="Huginn-MoE LoopSched Results" />
+  <table name="ouro_moe_speed" columns="shape schedule cut_pct median_ms speedup" title="Ouro-MoE Real GPU Speedup" />
+  <table name="huginn_moe_speed" columns="shape schedule cut_pct median_ms speedup" title="Huginn-MoE Real GPU Speedup" />
+  <table name="ouro_moe_geom" columns="stage cos_e1_e2 gamma_opt k1_renorm k1_opt k0_sens" title="Ouro-MoE Stage Geometry" />
+  <table name="huginn_moe_geom" columns="stage cos_e1_e2 gamma_opt k1_renorm k1_opt k0_sens" title="Huginn-MoE Stage Geometry" />
+</view>

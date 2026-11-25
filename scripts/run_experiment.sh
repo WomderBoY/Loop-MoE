@@ -81,6 +81,14 @@ elif [[ "$IDEA" == "probe2_loopmoe_skip_prune" ]]; then
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "r2a_loopsched_moe" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_r2a_loopsched.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.r2a_loopsched_moe \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1

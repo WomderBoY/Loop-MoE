@@ -39,6 +39,8 @@ DYNAMIC_DATASET_REPOS: dict[str, tuple[str, list[str]]] = {
     "gsm8k": ("openai/gsm8k", ["main/train", "main/test"]),
     "math500": ("HuggingFaceH4/MATH-500", ["test"]),
     "arc_challenge": ("allenai/ai2_arc", ["ARC-Challenge/test", "ARC-Challenge/validation"]),
+    "arc_easy": ("allenai/ai2_arc", ["ARC-Easy/test"]),
+    "openbookqa": ("allenai/openbookqa", ["main/test"]),
 }
 
 MODEL_REPOS: dict[str, tuple[str, str]] = {
@@ -303,18 +305,19 @@ def load_math500_samples(
     return out
 
 
-def load_arc_challenge_samples(
-    dataset_dir: str | Path,
+def _load_mcq_parquet(
+    p_dir: Path,
     *,
-    n_samples: int = 200,
-    seed: int = 20261124,
+    prefix: str,
+    n_samples: int,
+    seed: int,
+    question_key: str = "question",
 ) -> list[dict[str, Any]]:
-    p_dir = Path(dataset_dir) / "arc_challenge"
     cands = sorted(p_dir.rglob("*test*.parquet"))
     if not cands:
         cands = sorted(p_dir.rglob("*.parquet"))
     if not cands:
-        raise FileNotFoundError(f"ARC-Challenge parquet not found under {p_dir}")
+        raise FileNotFoundError(f"{prefix} parquet not found under {p_dir}")
     rows = _read_parquet_rows(cands[0])
     rng = random.Random(seed)
     idxs = list(range(len(rows)))
@@ -328,18 +331,64 @@ def load_arc_challenge_samples(
         ans_key = str(r.get("answerKey", "")).strip()
         if ans_key not in labels or len(labels) < 2:
             continue
+        q_val = r.get(question_key, r.get("question_stem", ""))
         out.append(
             {
-                "id": str(r.get("id", f"arc_{i}")),
-                "question": str(r["question"]).strip(),
+                "id": str(r.get("id", f"{prefix}_{i}")),
+                "question": str(q_val).strip(),
                 "choice_labels": labels,
                 "choice_texts": texts,
                 "gold_idx": labels.index(ans_key),
             }
         )
-        if len(out) >= n_samples:
+        if n_samples > 0 and len(out) >= n_samples:
             break
     return out
+
+
+def load_arc_challenge_samples(
+    dataset_dir: str | Path,
+    *,
+    n_samples: int = 200,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    return _load_mcq_parquet(
+        Path(dataset_dir) / "arc_challenge",
+        prefix="arc_c",
+        n_samples=n_samples,
+        seed=seed,
+        question_key="question",
+    )
+
+
+def load_arc_easy_samples(
+    dataset_dir: str | Path,
+    *,
+    n_samples: int = 600,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    return _load_mcq_parquet(
+        Path(dataset_dir) / "arc_easy",
+        prefix="arc_e",
+        n_samples=n_samples,
+        seed=seed,
+        question_key="question",
+    )
+
+
+def load_openbookqa_samples(
+    dataset_dir: str | Path,
+    *,
+    n_samples: int = 500,
+    seed: int = 20261124,
+) -> list[dict[str, Any]]:
+    return _load_mcq_parquet(
+        Path(dataset_dir) / "openbookqa",
+        prefix="obqa",
+        n_samples=n_samples,
+        seed=seed,
+        question_key="question_stem",
+    )
 
 
 # ---------------------------------------------------------------------------

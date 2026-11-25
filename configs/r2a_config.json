@@ -1,0 +1,8 @@
+{
+  "brief": {
+    "question": "Does LoopSched-MoE (tri-level k in {0,1,2} DP + closed-form optimal scale gamma_v* + loop-visit dynamic skipping) beat Uniform-Renorm/NoRen, Layer-Only (no loop info), Static-Top1, and Drop-Last-Loops on NLL + 2,272 MCQ items (ARC-C, ARC-E, OBQA), AND deliver real wall-clock GPU speedup on RTX PRO 5000?",
+    "healthy": "Exactness passes (<1e-2); batched eval advances every ~20-45s across 21 conditions per model (~22-30 min total across Ouro-MoE and Huginn-MoE).",
+    "noise": "Downloading arc_easy and openbookqa parquet (~2 MB) once on first run is expected.",
+    "worth_a_flag": "Any exactness failure, NaN NLL, OOM, or speedup < 1.0x at -50% cut."
+  }
+}
