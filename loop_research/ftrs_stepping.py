@@ -878,7 +878,11 @@ def verify_engine_exactness(model, engine: OuroCalibratedEngine, tokenizer, devi
     eng_logits_1, _ = engine.forward_policy_logits(t1, StepPolicy(name="verify", n_loops=engine.train_loops))
     diff_1 = float((hf_logits_1 - eng_logits_1.cpu()).abs().max().item())
 
-    # 2) Left-padded B=2 exactness
+    # 2) Left-padded B=2 exactness vs each prompt's TRUE unpadded B=1 native HF logits!
+    t2_unpad = torch.tensor([ids2], device=device, dtype=torch.long)
+    hf_logits_p2 = model(input_ids=t2_unpad, use_cache=False).logits[0, -1, :].float().cpu()
+    hf_logits_ref = torch.stack([hf_logits_1[0, -1, :], hf_logits_p2], dim=0)  # [2, V]
+
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (tokenizer.eos_token_id or 0)
     max_l = max(len(ids1), len(ids2))
     t2 = torch.full((2, max_l), pad_id, device=device, dtype=torch.long)
@@ -886,11 +890,10 @@ def verify_engine_exactness(model, engine: OuroCalibratedEngine, tokenizer, devi
     for row, ids in enumerate([ids1, ids2]):
         t2[row, max_l - len(ids) :] = torch.tensor(ids, device=device, dtype=torch.long)
         m2[row, max_l - len(ids) :] = 1
-    hf_logits_2 = model(input_ids=t2, attention_mask=m2, use_cache=False).logits[:, -1, :].float().cpu()
     eng_logits_2, _ = engine.forward_policy_logits(
         t2, StepPolicy(name="verify2", n_loops=engine.train_loops), attention_mask=m2
     )
-    diff_2 = float((hf_logits_2 - eng_logits_2[:, -1, :].cpu()).abs().max().item())
+    diff_2 = float((hf_logits_ref - eng_logits_2[:, -1, :].cpu()).abs().max().item())
 
     # 3) 4-step KV-cached greedy decode exactness
     gen_eng, _ = engine.generate_batched(
