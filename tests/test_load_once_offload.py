@@ -1,9 +1,13 @@
 """Check persistent versus scratch lifetime without CUDA or model inference."""
 import unittest
-from loop_research.load_once_offload import SlotPlan
+from loop_research.load_once_offload import SlotPlan,legacy_runtime
 
 
 class TestSlots(unittest.TestCase):
+    def test_archived_runtime_imports(self):
+        self.assertEqual([c.__name__ for c in legacy_runtime()],
+                         ["LoopedIncrementalEngine","FastPinnedExpertStore","FullResidentFastExecutor"])
+
     def test_retention_and_sequential_escapes(self):
         p=SlotPlan([(0,0),(1,0)],7,{0,1},True)
         self.assertEqual(p.locate(0,0,0,True),(0,False))

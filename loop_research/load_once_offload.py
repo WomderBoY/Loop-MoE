@@ -14,7 +14,6 @@ import json
 import math
 import os
 from pathlib import Path
-import sys
 import time
 
 import numpy as np
@@ -30,10 +29,9 @@ from loop_research.load_once import Routing, evaluate, make_hot, bootstrap
 
 def legacy_runtime():
     """Reuse the previously verified per-visit KV engine and packed expert store."""
-    root=Path(__file__).resolve().parents[1]/"archive/moe-scheduling/ifm_phase"
-    sys.path.insert(0,str(root))
-    from loop_moe.ifm_b1_kv_verify import LoopedIncrementalEngine
-    from loop_moe.ifm_b2_gpu_fast import FastPinnedExpertStore, FullResidentFastExecutor
+    from loop_research.ifm_offload_runtime import (
+        LoopedIncrementalEngine, FastPinnedExpertStore, FullResidentFastExecutor,
+    )
     return LoopedIncrementalEngine,FastPinnedExpertStore,FullResidentFastExecutor
 
 
