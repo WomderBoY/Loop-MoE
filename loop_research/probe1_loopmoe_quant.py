@@ -341,8 +341,12 @@ def collect_calibration_stats(
                     v = visits[lid_c]
                     if v < max_visits and lid_c in last_routed:
                         x_in, idx, weights = last_routed[lid_c]
-                        # group_sizes is [E] counts on GPU/CPU; y is grouped output [sum(group_sizes), D]
-                        gs_cpu = group_sizes.detach().cpu().tolist()
+                        # group_sizes may be a Python list[int] or Tensor; y is grouped output [sum(group_sizes), D]
+                        gs_cpu = (
+                            group_sizes.detach().cpu().tolist()
+                            if torch.is_tensor(group_sizes)
+                            else [int(g) for g in group_sizes]
+                        )
                         # Accumulate counts & gate weights
                         flat_idx = idx.reshape(-1)
                         flat_w = weights.float().reshape(-1)
@@ -494,7 +498,7 @@ def router_trace_context(
                         same_0 = (idx[..., 0] == ref_idx[..., 0]) | (idx[..., 0] == ref_idx[..., 1])
                         same_1 = (idx[..., 1] == ref_idx[..., 0]) | (idx[..., 1] == ref_idx[..., 1])
                         any_flip = int((~(same_0 & same_1)).sum().item())
-                        n_tok = int(idx.shape[0] * idx.shape[1]) if idx.ndim == 3 else int(idx.shape[0])
+                        n_tok = int(idx.numel() // idx.shape[-1])
                         if lid_c in recurrent_layers and v < max_visits:
                             state["flip_top1_num"][v] += top1_flip
                             state["flip_any_num"][v] += any_flip
