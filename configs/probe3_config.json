@@ -1,0 +1,8 @@
+{
+  "brief": {
+    "question": "What are the depth scaling curves (R=1..6) of Ouro-1.4B-Thinking and Ouro-2.6B-Thinking, does floor R_min=2 fix the R=1 KV poisoning early-exit crash, and does <think> phase-split recurrence preserve accuracy while cutting compute?",
+    "healthy": "Exactness passes with B=1 diff < 0.15 and 4-tok match; runs cleanly under 20 GiB VRAM without OOM (~25-30 min total).",
+    "noise": "Waiting briefly for an idle GPU and HF cache_position docstring warnings from Ouro modeling_ouro.py are expected.",
+    "worth_a_flag": "Any CUDA OOM, exactness check failure, or 0% completion rate on Thinking models."
+  }
+}

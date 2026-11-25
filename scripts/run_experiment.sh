@@ -72,6 +72,13 @@ elif [[ "$IDEA" == "new_dir1_ftrs" ]]; then
     --model-dir "$MODEL_DIR" \
     --dataset-dir "$DATASET_DIR" \
     --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "probe3_thinking_depth" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_probe3_depth.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.probe3_thinking_depth \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2
   exit 1

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -121,36 +122,55 @@ class GPULock:
             self._fp = None
 
 
-def acquire_idle_gpu(preferred_index: int | None = None) -> tuple[int, GPULock, GPUStatus]:
-    """Select and lock an idle GPU without ever touching another user's GPU."""
+def acquire_idle_gpu(
+    preferred_index: int | None = None,
+    *,
+    wait_timeout_sec: int = 1800,
+    poll_interval_sec: int = 15,
+) -> tuple[int, GPULock, GPUStatus]:
+    """Select and lock an idle GPU without ever touching another user's GPU.
+
+    If all GPUs are currently occupied or locked by sibling runs, waits politely up to
+    wait_timeout_sec before failing.
+    """
     env_pref = os.environ.get("LOOP_GPU_INDEX", "").strip()
     if preferred_index is None and env_pref:
         preferred_index = int(env_pref)
 
-    gpus = query_gpus()
-    if not gpus:
-        raise RuntimeError("No GPUs found via nvidia-smi")
+    deadline = time.monotonic() + max(0, int(wait_timeout_sec))
+    waited = False
+    while True:
+        gpus = query_gpus()
+        if not gpus:
+            raise RuntimeError("No GPUs found via nvidia-smi")
 
-    by_idx = {g.index: g for g in gpus}
-    order: list[int] = []
-    if preferred_index is not None:
-        if preferred_index not in by_idx:
-            raise RuntimeError(f"Requested GPU {preferred_index} does not exist (available: {sorted(by_idx)})")
-        order.append(preferred_index)
-    for g in gpus:
-        if g.index not in order:
-            order.append(g.index)
+        by_idx = {g.index: g for g in gpus}
+        order: list[int] = []
+        if preferred_index is not None:
+            if preferred_index not in by_idx:
+                raise RuntimeError(
+                    f"Requested GPU {preferred_index} does not exist (available: {sorted(by_idx)})"
+                )
+            order.append(preferred_index)
+        for g in gpus:
+            if g.index not in order:
+                order.append(g.index)
 
-    for idx in order:
-        g = by_idx[idx]
-        if not g.is_idle:
-            continue
-        lock = GPULock(idx)
-        if lock.try_acquire():
-            return idx, lock, g
+        for idx in order:
+            g = by_idx[idx]
+            if not g.is_idle:
+                continue
+            lock = GPULock(idx)
+            if lock.try_acquire():
+                return idx, lock, g
 
-    summary = ", ".join(
-        f"gpu{g.index}(mem={g.mem_used_mib}MiB,util={g.util_pct}%,pids={g.active_pids})"
-        for g in gpus
-    )
-    raise RuntimeError(f"No idle unlocked GPU available! Current status: {summary}")
+        summary = ", ".join(
+            f"gpu{g.index}(mem={g.mem_used_mib}MiB,util={g.util_pct}%,pids={g.active_pids})"
+            for g in gpus
+        )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"No idle unlocked GPU available! Current status: {summary}")
+        if not waited:
+            print(f"[gpu_utils] All GPUs busy/locked; waiting politely for an idle GPU ({summary})", flush=True)
+            waited = True
+        time.sleep(max(1, int(poll_interval_sec)))

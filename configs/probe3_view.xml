@@ -1,0 +1,21 @@
+<signal name="policy" label="Policy" />
+<signal name="mean_r" label="Mean Loops" digits="2" better="lower" />
+<signal name="acc" label="Accuracy" digits="1" scale="100" unit="%" better="higher" />
+<signal name="mean_toks" label="Mean Tokens" digits="0" />
+<signal name="elapsed_s" label="Time" digits="1" unit="s" better="lower" />
+<signal name="o14_r4_acc" label="Ouro-1.4B GSM R=4" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o14_kl_rmin2_acc" label="Ouro-1.4B KL Rmin=2" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o14_gate_rmin1_acc" label="Ouro-1.4B Gate Rmin=1" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o14t_math_r4_acc" label="1.4B-Think MATH R=4" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o14t_math_r6_acc" label="1.4B-Think MATH R=6" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o14t_math_kl2_acc" label="1.4B-Think MATH KL Rmin=2" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o26t_math_r4_acc" label="2.6B-Think MATH R=4" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o26t_math_r6_acc" label="2.6B-Think MATH R=6" digits="1" scale="100" unit="%" better="higher" />
+<signal name="o26t_math_kl2_acc" label="2.6B-Think MATH KL Rmin=2" digits="1" scale="100" unit="%" better="higher" />
+<view headline="o26t_math_kl2_acc o14t_math_kl2_acc o14_kl_rmin2_acc">
+  <stats of="o14_r4_acc o14_kl_rmin2_acc o14_gate_rmin1_acc o14t_math_r4_acc o14t_math_r6_acc o14t_math_kl2_acc o26t_math_r4_acc o26t_math_r6_acc o26t_math_kl2_acc" vs="final" />
+  <table name="ouro14b_gsm8k" columns="policy mean_r acc mean_toks elapsed_s" title="Ouro-1.4B GSM8K (n=160)" />
+  <table name="ouro14b_thinking_gsm8k" columns="policy mean_r acc mean_toks elapsed_s" title="Ouro-1.4B-Thinking GSM8K (n=100)" />
+  <table name="ouro14b_thinking_math500" columns="policy mean_r acc mean_toks elapsed_s" title="Ouro-1.4B-Thinking MATH-500 (n=100)" />
+  <table name="ouro26b_thinking_math500" columns="policy mean_r acc mean_toks elapsed_s" title="Ouro-2.6B-Thinking MATH-500 (n=80)" />
+</view>
