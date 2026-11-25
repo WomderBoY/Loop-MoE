@@ -56,18 +56,23 @@ def build_visit_topology(
     loop_end: int,
     n_loops: int,
 ) -> list[dict[str, Any]]:
-    """Return ordered list of logical layer visits in one forward pass."""
+    """Return ordered list of logical layer visits in one forward pass.
+
+    Follows xLLM's exact convention where recurrent layers are range(loop_start, loop_end):
+      - Ouro-MoE:   n_layers=28, loop_start=0, loop_end=28, n_loops=4 -> 112 visits
+      - Huginn-MoE: n_layers=28, loop_start=8, loop_end=20, n_loops=8 -> 8 + 12*8 + 8 = 112 visits
+    """
     visits: list[dict[str, Any]] = []
-    # Prelude layers
+    # Prelude layers: [0, loop_start)
     for lid in range(0, loop_start):
         visits.append({"vid": len(visits), "layer_id": lid, "loop_idx": 0, "stage": "prelude", "is_rec": False})
-    # Recurrent body: loops 0..n_loops-1
-    rec_layers = list(range(loop_start, n_layers - loop_end))
+    # Recurrent body: [loop_start, loop_end) repeated n_loops times
+    rec_layers = list(range(loop_start, loop_end))
     for r in range(n_loops):
         for lid in rec_layers:
             visits.append({"vid": len(visits), "layer_id": lid, "loop_idx": r, "stage": f"loop_{r}", "is_rec": True})
-    # Coda layers
-    for lid in range(n_layers - loop_end, n_layers):
+    # Coda layers: [loop_end, n_layers)
+    for lid in range(loop_end, n_layers):
         visits.append({"vid": len(visits), "layer_id": lid, "loop_idx": 0, "stage": "coda", "is_rec": False})
     return visits
 
@@ -710,8 +715,6 @@ def calibrate_loopsched(
     base_nll = eval_nll_batched(model, calib_sub, base_exec, device, batch_size=8)["nll"]
 
     sens_k1_opt = np.zeros(V, dtype=np.float64)
-    sens_k1_noren = np.zeros(V, dtype=np.float64)
-    sens_k1_renorm = np.zeros(V, dtype=np.float64)
     sens_k0 = np.zeros(V, dtype=np.float64)
 
     for v in range(V):
@@ -720,14 +723,6 @@ def calibrate_loopsched(
         vk[v] = 1
         ex_opt = LoopSchedExecutor(model, topo, mode="static", visit_k=vk, visit_gamma=visit_gamma, renorm_on_drop2=False)
         sens_k1_opt[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_opt, device, batch_size=8)["nll"] - base_nll)
-
-        # k=1 with NoRen (gamma=1)
-        ex_nr = LoopSchedExecutor(model, topo, mode="static", visit_k=vk, visit_gamma=[1.0] * V, renorm_on_drop2=False)
-        sens_k1_noren[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_nr, device, batch_size=8)["nll"] - base_nll)
-
-        # k=1 with Renorm
-        ex_rn = LoopSchedExecutor(model, topo, mode="static", visit_k=vk, visit_gamma=[1.0] * V, renorm_on_drop2=True)
-        sens_k1_renorm[v] = max(1e-6, eval_nll_batched(model, calib_sub, ex_rn, device, batch_size=8)["nll"] - base_nll)
 
         # k=0 (skip routed MoE)
         vk0 = [2] * V
@@ -746,7 +741,7 @@ def calibrate_loopsched(
             layer_sens_k1[v] = m1
             layer_sens_k0[v] = m0
 
-    # Aggregate stage summary for readable reporting
+    # Joint per-stage ablation summary (exact Renorm vs NoRen vs Opt gamma* vs k=0 per stage)
     stages_order: list[str] = []
     for d in topo:
         if d["stage"] not in stages_order:
@@ -754,16 +749,26 @@ def calibrate_loopsched(
     stage_summary: list[dict[str, Any]] = []
     for st in stages_order:
         vids_s = [d["vid"] for d in topo if d["stage"] == st]
+        vk_s1 = [1 if v in vids_s else 2 for v in range(V)]
+        vk_s0 = [0 if v in vids_s else 2 for v in range(V)]
+        ex_sr = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s1, visit_gamma=[1.0] * V, renorm_on_drop2=True)
+        ex_sn = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s1, visit_gamma=[1.0] * V, renorm_on_drop2=False)
+        ex_so = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s1, visit_gamma=visit_gamma, renorm_on_drop2=False)
+        ex_s0 = LoopSchedExecutor(model, topo, mode="static", visit_k=vk_s0, visit_gamma=visit_gamma, renorm_on_drop2=False)
+        d_sr = eval_nll_batched(model, calib_sub, ex_sr, device, batch_size=8)["nll"] - base_nll
+        d_sn = eval_nll_batched(model, calib_sub, ex_sn, device, batch_size=8)["nll"] - base_nll
+        d_so = eval_nll_batched(model, calib_sub, ex_so, device, batch_size=8)["nll"] - base_nll
+        d_s0 = eval_nll_batched(model, calib_sub, ex_s0, device, batch_size=8)["nll"] - base_nll
         stage_summary.append(
             {
                 "stage": st,
                 "n_visits": len(vids_s),
                 "mean_cos_e1_e2": float(np.mean([visit_cos[v] for v in vids_s])),
                 "mean_gamma_opt": float(np.mean([visit_gamma[v] for v in vids_s])),
-                "sum_sens_k1_renorm": float(np.sum(sens_k1_renorm[vids_s])),
-                "sum_sens_k1_noren": float(np.sum(sens_k1_noren[vids_s])),
-                "sum_sens_k1_opt": float(np.sum(sens_k1_opt[vids_s])),
-                "sum_sens_k0": float(np.sum(sens_k0[vids_s])),
+                "sum_sens_k1_renorm": float(d_sr),
+                "sum_sens_k1_noren": float(d_sn),
+                "sum_sens_k1_opt": float(d_so),
+                "sum_sens_k0": float(d_s0),
             }
         )
 
@@ -773,8 +778,7 @@ def calibrate_loopsched(
         "visit_cos": visit_cos,
         "visit_ratios": visit_ratios,
         "sens_k1_opt": sens_k1_opt,
-        "sens_k1_noren": sens_k1_noren,
-        "sens_k1_renorm": sens_k1_renorm,
+        "sens_k1_noren": sens_k1_opt,
         "sens_k0": sens_k0,
         "layer_sens_k1": layer_sens_k1,
         "layer_sens_k0": layer_sens_k0,

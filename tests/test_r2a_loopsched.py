@@ -104,7 +104,7 @@ class _MockLayer(nn.Module):
 
 
 class _MockLoopedModel(nn.Module):
-    def __init__(self, vocab: int = 32, dim: int = 16, n_layers: int = 4, loop_start: int = 1, loop_end: int = 1, n_loops: int = 3, n_experts: int = 6):
+    def __init__(self, vocab: int = 32, dim: int = 16, n_layers: int = 4, loop_start: int = 1, loop_end: int = 3, n_loops: int = 3, n_experts: int = 6):
         super().__init__()
         self.emb = nn.Embedding(vocab, dim)
         self.layers = nn.ModuleList([_MockLayer(dim, n_experts) for _ in range(n_layers)])
@@ -118,9 +118,9 @@ class _MockLoopedModel(nn.Module):
         for lid in range(0, self.loop_start_layer):
             h = self.layers[lid](h)
         for _r in range(self.loop_times):
-            for lid in range(self.loop_start_layer, len(self.layers) - self.loop_end_layers):
+            for lid in range(self.loop_start_layer, self.loop_end_layers):
                 h = self.layers[lid](h)
-        for lid in range(len(self.layers) - self.loop_end_layers, len(self.layers)):
+        for lid in range(self.loop_end_layers, len(self.layers)):
             h = self.layers[lid](h)
         return self.head(h), None, None
 
@@ -132,6 +132,21 @@ class _MockTok:
 
 
 class TestR2ALoopSched(unittest.TestCase):
+    def test_topology_matches_ifm_ouro_and_huginn(self):
+        ouro_topo = build_visit_topology(28, 0, 28, 4)
+        self.assertEqual(len(ouro_topo), 112)
+        self.assertEqual(ouro_topo[0]["stage"], "loop_0")
+        self.assertEqual(ouro_topo[-1]["stage"], "loop_3")
+        self.assertEqual(ouro_topo[-1]["layer_id"], 27)
+        self.assertEqual(ouro_topo[-1]["loop_idx"], 3)
+
+        hug_topo = build_visit_topology(28, 8, 20, 8)
+        self.assertEqual(len(hug_topo), 112)
+        self.assertEqual(sum(1 for d in hug_topo if d["stage"] == "prelude"), 8)
+        self.assertEqual(sum(1 for d in hug_topo if d["stage"] == "coda"), 8)
+        self.assertEqual(sum(1 for d in hug_topo if d["is_rec"]), 96)
+        self.assertEqual(hug_topo[-1]["layer_id"], 27)
+
     def test_dp_knapsack_exact_optimality(self):
         # 4 visits: middle visits 1 & 2 cheap for k=0; boundary visits 0 & 3 expensive
         c1 = np.array([0.05, 0.01, 0.01, 0.30])
