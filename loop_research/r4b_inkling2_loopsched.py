@@ -646,9 +646,9 @@ def main() -> None:
         diag_seqs = calib_a[: int(cfg.get("n_diag", 4))]
 
         mcq_limits = cfg.get("mcq_limits", {"arc_challenge": 1172, "arc_easy": 600, "openbookqa": 500})
-        arc_c_enc = prepare_mcq_encoded_hf(load_arc_challenge_samples(Path(args.dataset_dir), limit=int(mcq_limits["arc_challenge"])), tokenizer)
-        arc_e_enc = prepare_mcq_encoded_hf(load_arc_easy_samples(Path(args.dataset_dir), limit=int(mcq_limits["arc_easy"])), tokenizer)
-        obqa_enc = prepare_mcq_encoded_hf(load_openbookqa_samples(Path(args.dataset_dir), limit=int(mcq_limits["openbookqa"])), tokenizer)
+        arc_c_enc = prepare_mcq_encoded_hf(load_arc_challenge_samples(Path(args.dataset_dir), n_samples=int(mcq_limits["arc_challenge"]), seed=int(cfg.get("seed", 20261126))), tokenizer)
+        arc_e_enc = prepare_mcq_encoded_hf(load_arc_easy_samples(Path(args.dataset_dir), n_samples=int(mcq_limits["arc_easy"]), seed=int(cfg.get("seed", 20261126))), tokenizer)
+        obqa_enc = prepare_mcq_encoded_hf(load_openbookqa_samples(Path(args.dataset_dir), n_samples=int(mcq_limits["openbookqa"]), seed=int(cfg.get("seed", 20261126))), tokenizer)
         print(f"[r4b:inkling2] Loaded splits: diag={len(diag_seqs)}, calib_a={len(calib_a)}, calib_b={len(calib_b)}, eval={len(eval_seqs)} | MCQ: ARC-C={len(arc_c_enc)}, ARC-E={len(arc_e_enc)}, OBQA={len(obqa_enc)}", flush=True)
 
         speed_schedule_names = [
