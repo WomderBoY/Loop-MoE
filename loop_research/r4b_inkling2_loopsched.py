@@ -614,7 +614,7 @@ def main() -> None:
     except RuntimeError as exc:
         print(f"[r4b:inkling2] No completely idle GPU available ({exc}). Current GPUs:", flush=True)
         for g in query_gpus():
-            print(f"  GPU {g.index}: {g.name} mem={g.memory_used_mib}MiB util={g.utilization_pct}% pids={g.active_pids}", flush=True)
+            print(f"  GPU {g.index}: {g.name} mem={g.mem_used_mib}MiB util={g.util_pct}% pids={g.active_pids}", flush=True)
         if exit_if_busy:
             print("[r4b:inkling2] Exiting cleanly (EXIT_IF_NO_IDLE_GPU=1).", flush=True)
             return
@@ -622,7 +622,7 @@ def main() -> None:
 
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-        print(f"[r4b:inkling2] Acquired idle GPU {gpu_idx}: {gpu_status.name} (mem={gpu_status.memory_used_mib}MiB, util={gpu_status.utilization_pct}%)", flush=True)
+        print(f"[r4b:inkling2] Acquired idle GPU {gpu_idx}: {gpu_status.name} (mem={gpu_status.mem_used_mib}MiB, util={gpu_status.util_pct}%)", flush=True)
 
         # Load tokenizer + disjoint datasets (identical suites to R2-A / R3 / R4-A!)
         from transformers import AutoTokenizer  # type: ignore

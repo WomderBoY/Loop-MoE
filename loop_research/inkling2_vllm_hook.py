@@ -673,8 +673,8 @@ class Inkling2VLLMClassPatch:
             if k_v == k_base and ctrl.shrink_mode == "renorm":
                 return orig_forward(moe_self, x, reduce=reduce, push=push, lora=lora, pass_idx=pass_idx)
 
-            # Complete visit skip (k_v == 0)
-            if k_v == 0:
+            # Complete visit skip (k_v == 0) or empty batch
+            if k_v == 0 or int(x.shape[0]) == 0:
                 assert reduce and push is None and lora is None, "k_v=0 requires TP=1 reduce=True"
                 return torch.zeros_like(x)
 
@@ -686,6 +686,8 @@ class Inkling2VLLMClassPatch:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 is_padding = get_forward_context().is_padding
 
+            from vllm.models.inkling2.nvidia.ops.trtllm_bmm import ExpertPlan
+
             plan = expert_plan(
                 int(x_c.shape[0]),
                 k_v,
@@ -693,6 +695,9 @@ class Inkling2VLLMClassPatch:
                 experts.nvfp4,
                 experts.shapes,
             )
+            if plan.max_ctas < 2:
+                # Guarantee Triton associative_scan operates on length >= 2 even for T=1, k_v=1
+                plan = ExpertPlan(plan.tile, 2, plan.kernels)
             shrink_noren = ctrl.shrink_mode in ("noren", "opt")
             gamma_scale = float(ctrl.visit_gamma[vid]) if ctrl.shrink_mode == "opt" else 1.0
 
