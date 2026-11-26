@@ -1,0 +1,258 @@
+"""Lightweight CPU unit tests for Round 4: IFM Fast Engine, Stratified Swap Pareto & Inkling-2-Mini."""
+
+from __future__ import annotations
+
+import unittest
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from loop_research.ifm_fast_engine import (
+    IFMFastMoEExecutor,
+    fast_gpu_route_k1_or_k2,
+    pytorch_indexed_moe_ref,
+)
+from loop_research.r3_loopsched_v2 import LoopSchedV2Executor, build_visit_topology
+from loop_research.r4a_ifm_fast_and_swaps import (
+    build_stratified_k0_order,
+    solve_stratified_swap_pareto_and_full_spectrum,
+)
+from loop_research.r4b_inkling2_loopsched import (
+    build_inkling2_topology,
+    build_stage_schedule_inkling2,
+    generalized_shrinkage_stats,
+    solve_general_topk_iter_greedy,
+)
+
+
+class _DummyExperts(nn.Module):
+    def __init__(self, n_experts: int, dim: int, inter: int):
+        super().__init__()
+        self.n_local_experts = n_experts
+        self.model_dim = dim
+        self.inter_dim = inter
+        self.weight1 = nn.Parameter(torch.randn(n_experts * inter, dim) * 0.1)
+        self.weight2 = nn.Parameter(torch.randn(n_experts * dim, inter) * 0.1)
+        self.weight3 = nn.Parameter(torch.randn(n_experts * inter, dim) * 0.1)
+
+    def forward(self, x_perm: torch.Tensor, group_sizes: list[int]) -> torch.Tensor:
+        w1 = self.weight1.view(self.n_local_experts, self.inter_dim, self.model_dim)
+        w2 = self.weight2.view(self.n_local_experts, self.model_dim, self.inter_dim)
+        w3 = self.weight3.view(self.n_local_experts, self.inter_dim, self.model_dim)
+        outs = []
+        off = 0
+        for e, cnt in enumerate(group_sizes):
+            if cnt == 0:
+                continue
+            xe = x_perm[off : off + cnt]
+            off += cnt
+            h = F.silu(F.linear(xe, w1[e])) * F.linear(xe, w3[e])
+            outs.append(F.linear(h, w2[e]))
+        return torch.cat(outs, dim=0) if outs else torch.zeros_like(x_perm)
+
+
+class _DummyRouter(nn.Module):
+    def __init__(self, dim: int, n_experts: int, with_bias: bool = False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(n_experts, dim) * 0.2)
+        self.score_func = "softmax"
+        self.scaling_factor = 1.0
+        self.topk = 2
+        self.router_bias = nn.Parameter(torch.randn(n_experts) * 0.05) if with_bias else None
+
+    def forward(self, x: torch.Tensor, load_balancing_type=None):
+        logits = F.linear(x, self.weight).float()
+        orig = F.softmax(logits, dim=-1)
+        sel = orig + self.router_bias if self.router_bias is not None else orig
+        idx = torch.topk(sel, 2, dim=-1).indices
+        vals = torch.gather(orig, -1, idx)
+        vals = vals / vals.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return vals.to(x.dtype), idx, None, None
+
+
+class _DummyMoE(nn.Module):
+    def __init__(self, dim: int, inter: int, n_experts: int, with_bias: bool = False):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.router = _DummyRouter(dim, n_experts, with_bias=with_bias)
+        self.experts = _DummyExperts(n_experts, dim, inter)
+        self.fc1 = nn.Linear(dim, inter, bias=False)
+        self.fc2 = nn.Linear(inter, dim, bias=False)
+        self.fc3 = nn.Linear(dim, inter, bias=False)
+
+    def residual(self, y, residual, c=None):
+        return residual + y
+
+    def forward(self, x_in: torch.Tensor, load_balancing_type=None):
+        bsz, slen, dim = x_in.shape
+        n_tok = bsz * slen
+        x = self.norm(x_in)
+        y1 = self.fc2(F.silu(self.fc1(x)) * self.fc3(x))
+        w, idx, _, aux = self.router(x, load_balancing_type)
+        x_2d = x.reshape(n_tok, dim)
+        w1 = self.experts.weight1.view(self.experts.n_local_experts, self.experts.inter_dim, dim)
+        w2 = self.experts.weight2.view(self.experts.n_local_experts, dim, self.experts.inter_dim)
+        w3 = self.experts.weight3.view(self.experts.n_local_experts, self.experts.inter_dim, dim)
+        y2 = pytorch_indexed_moe_ref(x_2d, idx.reshape(n_tok, 2), w.reshape(n_tok, 2), w1, w2, w3).reshape(bsz, slen, dim)
+        return self.residual(y1 + y2, x_in), aux
+
+
+class _DummyLayer(nn.Module):
+    def __init__(self, dim: int, inter: int, n_experts: int, with_bias: bool = False):
+        super().__init__()
+        self.moe = _DummyMoE(dim, inter, n_experts, with_bias=with_bias)
+
+
+class _DummyLoopedModel(nn.Module):
+    def __init__(self, with_bias: bool = False):
+        super().__init__()
+        self.loop_start_layer = 1
+        self.loop_end_layers = 3
+        self.loop_times = 3
+        self.layers = nn.ModuleList([_DummyLayer(16, 12, 6, with_bias=with_bias) for _ in range(4)])
+
+    def forward(self, x: torch.Tensor):
+        for lid in range(0, self.loop_start_layer):
+            x, _ = self.layers[lid].moe(x)
+        for _ in range(self.loop_times):
+            for lid in range(self.loop_start_layer, self.loop_end_layers):
+                x, _ = self.layers[lid].moe(x)
+        for lid in range(self.loop_end_layers, len(self.layers)):
+            x, _ = self.layers[lid].moe(x)
+        return x
+
+
+class TestR4FastAndInkling(unittest.TestCase):
+    def test_ifm_fast_executor_bit_exact_against_r3_and_native(self):
+        for with_bias in (False, True):
+            torch.manual_seed(123 + int(with_bias))
+            model = _DummyLoopedModel(with_bias=with_bias)
+            topo = build_visit_topology(4, 1, 3, 3)  # V = 8
+
+            for shape in [(1, 1, 16), (4, 1, 16), (2, 5, 16)]:
+                x = torch.randn(*shape)
+                with torch.no_grad():
+                    y_nat = model(x)
+                    ex_f2 = IFMFastMoEExecutor(model, topo, visit_k=[2] * 8, use_fast_router=True)
+                    with ex_f2:
+                        ex_f2.reset_pass()
+                        y_f2 = model(x)
+                    self.assertLess((y_nat - y_f2).abs().max().item(), 1e-5)
+
+                    # Compare hybrid k={0,1,2} schedule between IFMFastMoEExecutor and LoopSchedV2Executor
+                    vk = [2, 1, 0, 1, 1, 0, 1, 2]
+                    ex_ref = LoopSchedV2Executor(model, topo, mode="static", visit_k=vk, renorm_on_drop2=False)
+                    with ex_ref:
+                        ex_ref.reset_pass()
+                        y_ref = model(x)
+                    ex_fast = IFMFastMoEExecutor(model, topo, visit_k=vk, renorm_on_drop2=False, use_fast_router=True)
+                    with ex_fast:
+                        ex_fast.reset_pass()
+                        y_fast = model(x)
+                    self.assertLess((y_ref - y_fast).abs().max().item(), 1e-5)
+
+    def test_stratified_order_and_swap_pareto_solver(self):
+        # 16-visit Huginn-like synthetic topology: 2 prelude + 4 loops x 3 layers + 2 coda = 16
+        topo = build_visit_topology(7, 2, 5, 4)  # 2 + 12 + 2 = 16
+        self.assertEqual(len(topo), 16)
+        stage_k0_map = {
+            "prelude": 6.0,
+            "loop_0": 0.40,
+            "loop_1": 0.04,  # ultra-redundant middle!
+            "loop_2": 0.05,  # ultra-redundant middle!
+            "loop_3": 0.18,
+            "coda": 2.5,
+        }
+        # Deliberately put noisy tiny screen_k0 in sensitive loop_0 to test stratification!
+        screen_k0 = np.full(16, 0.1, dtype=np.float64)
+        screen_k0[2] = 0.001  # loop_0 noise trap!
+        eligible = [t["vid"] for t in topo if t["is_rec"]]
+
+        order = build_stratified_k0_order(topo, stage_k0_map, screen_k0, eligible)
+        # First 6 items MUST come from primary low-sens stages loop_1 and loop_2 (NOT loop_0 trap vid=2!)
+        self.assertTrue(all(topo[v]["stage"] in ("loop_1", "loop_2") for v in order[:6]))
+
+        imp = np.array([1.0 if t["stage"] != "coda" else 10.0 for t in topo], dtype=np.float64)
+
+        def nonlinear_loss(vk: list[int]) -> float:
+            loss = 0.0
+            for v, k in enumerate(vk):
+                st = topo[v]["stage"]
+                if k == 1:
+                    loss += 0.6 if st == "coda" else 0.02
+                elif k == 0:
+                    loss += 0.06 if st in ("loop_1", "loop_2") else 0.5
+            for i in range(len(vk) - 1):
+                if vk[i] == 0 and vk[i + 1] == 0:
+                    loss += 3.0  # adjacent k=0 cascade
+            return loss
+
+        sol = solve_stratified_swap_pareto_and_full_spectrum(
+            eval_a_fn=nonlinear_loss,
+            eval_b_fn=nonlinear_loss,
+            topo=topo,
+            stage_k0_map=stage_k0_map,
+            importance=imp,
+            screen_k0_cost=screen_k0,
+            eligible_k0_vids=eligible,
+            max_swaps=4,
+            swap_checkpoints=(0, 2, 4),
+            cand_pool_size=6,
+            up_pool_size=2,
+        )
+        # Check exact active slot counts for -25%, -37.5%, -50%, -62.5%
+        self.assertEqual(sum(sol["vk_25_iter"]), 24)
+        self.assertEqual(sum(sol["vk_38_iter"]), 20)
+        self.assertEqual(sum(sol["vk_50_best"]), 16)
+        self.assertEqual(sum(sol["vk_62_strat"]), 12)
+        # Best swap must upgrade BOTH coda visits (14, 15) to k=2 using non-adjacent loop_1/2 k=0s!
+        self.assertEqual(sol["best_m"], 2)
+        self.assertEqual(sol["vk_50_best"][14], 2)
+        self.assertEqual(sol["vk_50_best"][15], 2)
+        self.assertFalse(any(sol["vk_50_best"][i] == 0 and sol["vk_50_best"][i + 1] == 0 for i in range(15)))
+
+    def test_inkling2_topology_generalized_shrinkage_and_topk_greedy(self):
+        topo = build_inkling2_topology(24, 6, 18, 3)
+        self.assertEqual(len(topo), 48)
+        self.assertEqual(sum(t["stage"] == "prelude" for t in topo), 6)
+        self.assertEqual(sum(t["stage"] == "coda" for t in topo), 6)
+        self.assertEqual(sum(t["is_rec"] for t in topo), 36)
+
+        # Synthetic orthogonal Top-8 experts with decaying norms -> MSE_renorm/MSE_noren must be >> 2.0!
+        torch.manual_seed(7)
+        N, K, D = 256, 8, 64
+        w = torch.linspace(0.25, 0.04, K).unsqueeze(0).expand(N, K)
+        # Near-orthogonal unit-ish experts with norm decay
+        e = torch.randn(N, K, D) / (D ** 0.5)
+        e = e * torch.linspace(1.5, 0.7, K).view(1, K, 1)
+        st4 = generalized_shrinkage_stats(w, e, k_keep=4)
+        self.assertGreater(st4["mse_ratio_ren_vs_noren"], 2.0)
+        self.assertLess(abs(st4["gamma_opt"] - 1.0), 0.15)
+
+        # Generalized Top-8 -> k_v greedy cutting 50% (384 -> 192 slots) protecting prelude/coda >= 6
+        def mock_loss(vk: list[int]) -> float:
+            tot = 0.0
+            for t, k in zip(topo, vk):
+                w_st = 5.0 if not t["is_rec"] else (0.2 if t["stage"] == "pass_1" else 0.8)
+                tot += w_st * ((8 - k) ** 1.5)
+            return tot
+
+        vk50 = solve_general_topk_iter_greedy(
+            mock_loss, topo, K_max=8, target_cut_frac=0.50,
+            stage_priority_order=["pass_1", "pass_0", "pass_2", "prelude", "coda"],
+            min_k_boundary=6, min_k_rec=1, step_delta_k=1, cand_pool_size=12,
+        )
+        self.assertEqual(sum(vk50), 192)
+        # Prelude & coda must stay high while pass_1 is heavily thinned
+        coda_mean = np.mean([vk50[t["vid"]] for t in topo if t["stage"] == "coda"])
+        pass1_mean = np.mean([vk50[t["vid"]] for t in topo if t["stage"] == "pass_1"])
+        self.assertGreater(coda_mean, pass1_mean + 2.0)
+
+        # Deterministic stage schedule check
+        vk_st = build_stage_schedule_inkling2(topo, {"prelude": 8, "pass_0": 4, "pass_1": 2, "pass_2": 4, "coda": 8})
+        self.assertEqual(sum(vk_st), 6 * 8 + 12 * 4 + 12 * 2 + 12 * 4 + 6 * 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

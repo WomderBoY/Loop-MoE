@@ -27,6 +27,8 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
+# Default: gracefully exit after downloading assets if all shared GPUs are occupied
+export EXIT_IF_NO_IDLE_GPU="${EXIT_IF_NO_IDLE_GPU:-1}"
 
 RUN_TAG="${ORX_RUN_ID:-manual-$(date +%Y%m%d-%H%M%S)}"
 OUT_DIR="${OUT_DIR:-$STORAGE_BASE/loop-research-runs/$RUN_TAG}"
@@ -41,7 +43,7 @@ NEED_XLLM="$("$PYTHON_BIN" -c "import json,sys; print(1 if json.load(open(sys.ar
 
 echo "[run] ROOT_DIR=$ROOT_DIR"
 echo "[run] CONFIG_PATH=$CONFIG_PATH"
-echo "[run] IDEA=$IDEA ASSETS=$ASSETS NEED_XLLM=$NEED_XLLM"
+echo "[run] IDEA=$IDEA ASSETS=$ASSETS NEED_XLLM=$NEED_XLLM EXIT_IF_NO_IDLE_GPU=$EXIT_IF_NO_IDLE_GPU"
 echo "[run] OUT_DIR=$OUT_DIR"
 echo "[run] GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo snapshot)"
 
@@ -53,35 +55,7 @@ report '{"phase":"download","step":0,"of":1,"unit":"assets"}'
 ASSETS="$ASSETS" bash scripts/download_assets.sh
 report '{"step":1}'
 
-if [[ "$IDEA" == "idea1_kv_depth" ]]; then
-  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.idea1_kv_depth \
-    --config "$CONFIG_PATH" \
-    --model-dir "$MODEL_DIR" \
-    --dataset-dir "$DATASET_DIR" \
-    --out-dir "$OUT_DIR"
-elif [[ "$IDEA" == "idea2_expert_unbinding" ]]; then
-  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.idea2_expert_unbinding \
-    --config "$CONFIG_PATH" \
-    --model-dir "$MODEL_DIR" \
-    --dataset-dir "$DATASET_DIR" \
-    --xllm-loop-dir "$XLLM_LOOP_DIR" \
-    --out-dir "$OUT_DIR"
-elif [[ "$IDEA" == "new_dir2_vsubmoe" ]]; then
-  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.vsubmoe_pilot \
-    --config "$CONFIG_PATH" \
-    --model-dir "$MODEL_DIR" \
-    --dataset-dir "$DATASET_DIR" \
-    --xllm-loop-dir "$XLLM_LOOP_DIR" \
-    --out-dir "$OUT_DIR"
-elif [[ "$IDEA" == "probe2_loopmoe_skip_prune" ]]; then
-  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_probe2_skip_prune.py -v
-  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.probe2_loopmoe_skip_prune \
-    --config "$CONFIG_PATH" \
-    --model-dir "$MODEL_DIR" \
-    --dataset-dir "$DATASET_DIR" \
-    --xllm-loop-dir "$XLLM_LOOP_DIR" \
-    --out-dir "$OUT_DIR"
-elif [[ "$IDEA" == "r2a_loopsched_moe" ]]; then
+if [[ "$IDEA" == "r2a_loopsched_moe" ]]; then
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_r2a_loopsched.py -v
   PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.r2a_loopsched_moe \
     --config "$CONFIG_PATH" \
@@ -96,6 +70,21 @@ elif [[ "$IDEA" == "r3_loopsched_v2" ]]; then
     --model-dir "$MODEL_DIR" \
     --dataset-dir "$DATASET_DIR" \
     --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "r4a_ifm_fast_and_swaps" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_r4_fast_and_inkling.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.r4a_ifm_fast_and_swaps \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
+    --xllm-loop-dir "$XLLM_LOOP_DIR" \
+    --out-dir "$OUT_DIR"
+elif [[ "$IDEA" == "r4b_inkling2_loopsched" ]]; then
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m unittest tests/test_r4_fast_and_inkling.py -v
+  PYTHONUNBUFFERED=1 "$PYTHON_BIN" -m loop_research.r4b_inkling2_loopsched \
+    --config "$CONFIG_PATH" \
+    --model-dir "$MODEL_DIR" \
+    --dataset-dir "$DATASET_DIR" \
     --out-dir "$OUT_DIR"
 else
   echo "[run] Unknown idea in $CONFIG_PATH: $IDEA" >&2

@@ -49,6 +49,7 @@ MODEL_REPOS: dict[str, tuple[str, str]] = {
     "ouro26b_thinking": ("ByteDance/Ouro-2.6B-Thinking", "ByteDance__Ouro-2.6B-Thinking"),
     "ifm_ouro": ("IFM/LoopedLM-P1-moe-ouro-500b", "IFM__LoopedLM-P1-moe-ouro-500b"),
     "ifm_huginn": ("IFM/LoopedLM-P1-moe-huginn-500b", "IFM__LoopedLM-P1-moe-huginn-500b"),
+    "inkling2_mini": ("thinkingmachines/Inkling-2-Mini", "thinkingmachines__Inkling-2-Mini"),
 }
 
 

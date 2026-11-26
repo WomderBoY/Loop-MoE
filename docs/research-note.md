@@ -1,62 +1,52 @@
-# Looped Transformer 研究笔记（ICML 2027 新方向）
+# LoopSched-MoE 研究笔记（ICML 2027 锁定主线）
 
-日期：2026-11-24
+更新日期：2026-11-26
 
-前期关于「MoE CPU–GPU 专家调度」的研究已完整归档至 `archive/moe-scheduling/`（详见 `archive/moe-scheduling/ARCHIVE_README.md`）。基于 2026-11-24 的最新文献调研（见 `artifacts/icml-2027-loop-directions-2026-11-24/research-directions.md`），当前同时对前两个首选方向开展决定性的初步可行性实验。
+前期已证伪的探索方向已完整归档至：
+- `archive/moe-scheduling/`（早期 CPU–GPU 专家卸载调度）
+- `archive/early-explorations-2026-11/`（前缀 KV 深度价值、跨轮解绑 / V-SubMoE、LoopQuant-MoE 混合比特量化、稠密 LoopLM 早退）
 
----
-
-## 方向 1：哪些 token 值得为了后文多算两轮？（Token KV Depth Value）
-
-### 核心假设
-> **一个当前容易预测的位置，可能是后文最需要深层 KV 的位置。** 当前预测收益（$\Delta_{\text{curr}}$）与后文 KV 写入收益（$\Delta_{\text{write}}$）可以分离测量。
-
-### 初步可行性实验协议（`loop_research/idea1_kv_depth.py`）
-- **模型**：原版冻结 `ByteDance/Ouro-1.4B`（24 层 × 4 loops，`total_ut_steps=4`，BF16）。
-- **一致性校验**：首先验证自定义 Ragged-KV 循环前向在全 4 轮模式下与原生 HuggingFace `OuroForCausalLM` 的 logits 误差 $< 10^{-4}$。
-- **28 组合事后最优（2/8 深块，25% 深前缀预算）**：
-  - 前缀等分为 8 块；浅块仅运行前 2 轮（`ut=0,1`），其第 3、4 轮（`ut=2,3`）供后文注意力的 K/V 按 Ragged KV 语义回退到同物理层的第 2 轮 K/V；深块与问题+答案后缀固定运行完整 4 轮。
-  - 穷举全部 $\binom{8}{2}=28$ 种组合，同时评估全浅（0/8）与全深（8/8）。
-- **三组探针**：
-  1. **Probe 1A（可控合成配对两跳问答）**：96 篇独立文档（每篇含两个互不相交的两跳事实链 + 4 条干扰事实，8 个事实分别落在 8 个块中），对**同一前缀**分别提出 Question A 与 Question B（所需证据在不同块），并对一半样本执行证据位置交换，以严格分离「内容依赖的真实证据写入」、「固定位置偏置」与「偷看未来问题的事后优势」。同时测量 Gold Answer NLL 与贪心 EM。
-  2. **Probe 1B（自然多跳问答 `framolfese/2WikiMultihopQA`）**：96 条验证集样本，保留答对与答错的全部抽样样本，记录每块与 `supporting_facts` 的重合度，测量 Answer NLL 与贪心 EM/F1。
-  3. **Probe 1C（当前收益 vs 后文 KV 写入收益解耦 + 因果选择器对比）**：在自然文本与代码样本上分别测量每块的 $\Delta_{\text{curr}}(b)$（全深历史下 2 轮 vs 4 轮当前块 NLL 差）与 $\Delta_{\text{write}}(b)$（仅将块 $b$ 的晚轮暴露 KV 降级为 2 轮导致后文近/中/远距 NLL 增量），检验两者相关性；并在 Probe 1A/1B 上对比全部严格因果在线基线（随机、前两块、后两块、交叉验证最优固定位置、循环2熵、FlashLoop 隐状态变化、Ouro 原生 `early_exit_gate`、loop1→loop2 KL、以及留出交叉验证的轻量因果线性预测器）。
-
-### 内部去留门槛
-1. 全浅（0/8）到全深（8/8）存在清晰的质量/NLL 差距。
-2. 25% 深块预算的事后最优（`oracle_2`）至少取回该差距的 **50%**，且在配对双问中随证据块移动。
-3. 因果可见特征或留出因果选择器能明显超越固定位置与低成本启发式（如至少取回事后最优相对最强简单基线优势的相当比例）。
+当前项目唯一聚焦 **ICML 2027** 旗舰主线：**`LoopSched-MoE` — 面向循环 MoE 大模型的正交专家收缩与非加性轨迹调度**。
 
 ---
 
-## 方向 2：Loop × MoE：同一个专家在哪几轮应该继续共享？（Expert Cross-Loop Unbinding）
+## 一、核心科学发现（Round 1 – Round 3 已严格验证）
 
-### 核心假设
-> **大部分专家从跨轮权重共享中获益，而跨轮梯度冲突导致的共享代价集中在少数可事先辨认的专家上。** 在相同总参数预算下，将逐轮专门化容量精准分配给高冲突专家，能显著优于均匀分配、常规重要性分配、逐轮标量与仅调路由。
+在 `IFM/LoopedLM-P1-moe-ouro-500b`（28 物理层 × 4 轮 = 112 访问，Top-2/64）与 `IFM/LoopedLM-P1-moe-huginn-500b`（8 prelude + 12 层 × 8 轮 + 8 coda = 112 访问，Top-2/64）上，基于严格不相交切分（`calib_a=16`, `calib_b=8`, `eval_heldout=64` Text+Code, 2,272 题零样本 MCQ：Full ARC-C 1,172 + ARC-E 600 + Full OBQA 500）完成验证：
 
-### 初步可行性实验协议（`loop_research/idea2_expert_unbinding.py`）
-- **模型**：公开的 `IFM/LoopedLM-P1-moe-ouro-500b`（28 物理层全部循环 4 轮，25 专家/层，Top-2）与 `IFM/LoopedLM-P1-moe-huginn-500b`（8 prelude + 12 循环层 × 8 轮 + 8 coda，25 专家/层，Top-2）。
-- **精确反传校验**：在 `loop_research/ifm_runtime.py` 中补充纯 PyTorch FP32 累加的 `group_rms_norm_bwd(_affine)` 与 `group_layer_norm_bwd(_affine)` 垫片，并验证拆分得到的各轮梯度之和 $\sum_r g_{e,r}$ 与原生 PyTorch `.grad` 误差 $< 10^{-4}$。
-- **三组严格不相交数据切分**（真实 WikiText + Python 代码混合）：
-  - `calib`（分 Split A 与 Split B 两个独立子批）：仅用于计算跨批次无偏冲突得分，不更新任何权重：
-    - $S^{\text{raw}}_e = \sum_r \langle \tilde g^{(A)}_{e,r}, \tilde g^{(B)}_{e,r} \rangle_F$（消除单批采样方差偏置）；
-    - $S^{\text{orth-}W}_e$：先剔除沿原权重 $W_e$ 方向的分量（排除逐轮乘性缩放即可解释的冲突）；
-    - $S^{\text{orth-mean}}_e$：剔除沿跨轮均值梯度 $\bar g_e$ 方向的分量（排除「共享 Adapter + 逐轮标量」即可解释的冲突）；
-    - 同时记录每专家总激活 token 数 $N_e$、逐轮分布、梯度范数与跨轮余弦矩阵。
-  - `adapt_train`（独立训练集）与 `eval_heldout`（独立留出集，评估时始终走原生 router 以包含下游路由变化）。
-- **两级因果检验**：
-  1. **Exp 2A（单专家局部反事实散点）**：对跨层抽样的专家逐一施加相同 L2 范数预算的「逐轮独立步」vs「跨轮共享步」（梯度来自 `adapt_train`），在 `eval_heldout` 测量真实 NLL 改善差值，与 `calib` 预测冲突得分做 Spearman/Pearson 相关性检验。
-  2. **Exp 2B（严格等参数量分组适配对照）**：在 6 个代表物理层（150 个专家）上固定完全一致的可训练参数预算（30 专家 × 逐轮 rank-5 = 150 专家 × 逐轮 rank-1 = 30 专家 × 共享 rank-20），对比：
-     - `conflict_top`（高冲突 Top-5/层，逐轮 rank-5）
-     - `matched_high` vs `matched_low`（层内按暴露量与梯度范数配对的高/低冲突组）
-     - `random`（层内随机 5/层，逐轮 rank-5）
-     - `gradnorm_top`（梯度范数 Top-5/层，逐轮 rank-5）
-     - `freq_top`（路由频率 Top-5/层，逐轮 rank-5）
-     - `shared_plus_scalar`（同高冲突 30 专家，1 个共享 rank-20 LoRA + 逐轮标量）
-     - `uniform_all`（全部 150 专家，逐轮 rank-1）
-     - `recon_layer`（按整层冲突选 Top 物理层、层内全专家解绑）
-     - `router_loop_mod`（冻结全部专家，仅在追踪层训练逐轮路由增量 + 逐轮 norm 调制，参数更少但直接测试路由能否化解冲突）。
+### 1. 深度放大的正交专家收缩定律（Orthogonal Expert Shrinkage）
+设 Top-$K$ 路由输出为 $y^{(K)} = \sum_{j=1}^K w_j e_j$（按权重降序），截断为 Top-$k$（$k < K$）并施加标量缩放 $\gamma$：$\hat{y}^{(k)}(\gamma) = \gamma \sum_{j=1}^k w_j e_j$。最小 MSE 闭式解为：
+$$\gamma^* = 1 + \frac{\mathbb{E}\!\left[\langle s_k, r_k \rangle\right]}{\mathbb{E}\!\left[\|s_k\|^2\right]}, \quad s_k = \sum_{j=1}^k w_j e_j,\; r_k = \sum_{j=k+1}^K w_j e_j$$
+对 $K=2, k=1$，传统重归一化 $\gamma_{\text{renorm}} = 1 + w_2/w_1$ 相对无重归一化（`NoRen`, $\gamma=1$）的均方误差放大倍数为：
+$$\frac{\text{MSE}_{\text{renorm}}}{\text{MSE}_{\text{noren}}} = 1 + \frac{\mathbb{E}[w_2^2\|e_1\|^2]}{\mathbb{E}[w_2^2\|e_2\|^2]} - 2\,\frac{\mathbb{E}[w_2^2\langle e_1, e_2\rangle]}{\mathbb{E}[w_2^2\|e_2\|^2]}$$
+- **实测验证（R3 `79965e0f`）**：循环体内 Top-1 与 Top-2 专家高度近正交（Ouro $\cos \in [+0.028, +0.086]$，Huginn $\cos \in [+0.048, +0.069]$）且主专家范数占优，`MSE_ren/noren` 在 Ouro 上随循环深度从 `2.23×`（`loop_0`）单调攀升至 **`4.94×`（`loop_3`）**，Huginn 保持 `2.11×–2.59×`；闭式最优 $\gamma_s^* \in [1.000, 1.030]$，说明**零参数 `NoRen` 已捕获 >98% 理论最优收益**。
+- **下游收益**：`NoRen` 在 `-25%/-37.5%/-50%` 上于 2,272 题 MCQ 分别带来 Ouro `+1.23 / +1.76 / +1.63 pp`、Huginn `+0.04 / +1.36 / +2.24 pp`（95% CI 全部显著 > 0）。
 
-### 内部去留门槛
-1. 跨独立批次的冲突得分 $S^{\text{orth-mean}}_e$ 具有强可复现性（高正值、显著集中于少数专家）。
-2. 在单专家反事实和等参数留出适配中，高冲突组显著优于匹配低冲突组、随机组，并且明显不被 `shared_plus_scalar`、`gradnorm_top`、`uniform_all` 或 `router_loop_mod` 吃掉收益。
+### 2. 非加性迭代贪心置换（`IterGreedy`）打破 `-50%` 全 Top-1 天花板
+- **R2-A 教训（`3c1b0d1d`）**：一阶加性背包（Additive DP）基于单访问独立敏感度同时注入 18–46 个并发 `k=0` 访问，引发严重非线性残差级联坍塌（ΔNLL `+0.87` 至 `+2.12`）。
+- **R3 突破（`79965e0f`）**：逐步在真实累积前向 NLL（并经独立 `calib_b` 早停防过拟合）上执行终层 `k=1→2` 与稀疏中段 `k=1→0` 置换：
+  - **精确 `-50.0%`（零动态开销）**：Ouro（`2/108/2`）达 `ΔNLL=+0.1782 / Avg MCQ=53.9%`，显著胜出 `all_top1_noren`（`+0.0503` nats / `+1.63 pp` CI `[+0.53, +2.77]`）与 `all_top1_renorm`（`+0.2244` nats / `+3.26 pp` CI `[+1.72, +4.89]`）；Huginn 仅凭 1 组置换（保护末层 `coda` `vid=111`）即削减 `37%` 全模型 ΔNLL（`+0.2161 → +0.1356`）。
+  - **超稀疏 `-62.5%`**：Ouro 胜过 `unif_k01` `+0.7032` nats / `+4.93 pp` MCQ；Huginn 胜过 `unif_k01` `+0.3023` nats / `+4.40 pp` MCQ（相对 R2-A 加性 DP 提升 `+9.8 pp`）。
+
+---
+
+## 二、Round 4 目标：真实系统加速、分层多组置换扫描与 `Inkling-2-Mini` 扩展
+
+针对 R3 暴露的两大核心工程与算法机会，Round 4 双轨并进：
+
+### 轨道 A（IFM Ouro-MoE & Huginn-MoE）：CUDA Graph + Triton Fused-MoE + 分层 `k=0/k=2` 置换帕累托
+1. **消除 Eager Python 派发瓶颈（`loop_research/ifm_fast_engine.py`）**：
+   - 零权重格式转换直接复用原生 `xllm` GPU 权重；
+   - 实现 **Triton 融合 GroupRMSNorm** + **Triton 零拷贝索引专家 SwiGLU 解码核（`triton_indexed_moe_swiglu`）**（直接按 `exp_ids` 原地索引 `weight1/2/3`，彻底消除 `index_select` 权重拷贝与 `.tolist()` 同步！）+ 原生零额外开销的 `k_v ∈ {0, 1, 2}` 静态路由；
+   - 使用 **静态 `torch.cuda.CUDAGraph`** 捕获整次 112 轮前向，在完全公平的 CUDA Graph 基线下测量 `bf16_base` vs `LoopSched` 的真实端到端 Decode (`B=1, 8, 32`) 与 Prefill (`B=8, L=256`) 加速。
+2. **修复分层候选池 + 显式扫描 `k=0/k=2` 置换对数 $m$（`loop_research/r4a_ifm_fast_and_swaps.py`）**：
+   - 将候选池改为按循环阶段分层抽样（确保 Huginn `loop_2..6` 充分进入候选池，突破 R3 仅 1 组置换的局限）；
+   - 在精确 `-50%` 预算下显式扫描置换组数 $m \in \{0, 2, 4, 6, 8, 12, 16\}$（含非相邻 `k=0` 约束），绘制完整的 **真实 GPU 延迟 vs 质量（NLL & 2,272 MCQ）二维帕累托前沿**；
+   - 将非加性迭代贪心推广至 `-25%`、`-37.5%` 纯 `k∈{1,2}` 调度，检验在 Ouro-MoE 上是否同样全面超越 `Layer-Only`。
+
+### 轨道 B（新模型 `thinkingmachines/Inkling-2-Mini`）：广义 Top-$8 \to k_v$ 调度与生产级 vLLM 加速
+- **架构亮点**：26.4B Looped Sparse MoE（6 prelude + 12 循环层 × 3 轮 + 6 coda = 48 逻辑层），**128 专家 Top-8，`n_shared_experts = 0`**，原生 **NVFP4 + MXFP8**（19.5 GB 单文件，完美契合 Blackwell RTX PRO 5000），获得 vLLM (`>=0.35.0`) / SGLang Day-0 原生支持。
+- **核心研究验证（`loop_research/r4b_inkling2_loopsched.py`）**：
+  1. 将正交专家收缩定理推广至一般 Top-$K \to k$（$K=8, k \in \{1..7\}$）；
+  2. 测量 48 逻辑访问的逐轮几何与敏感度分布（Prelude vs Pass 0/1/2 vs Coda）；
+  3. 细粒度逐访问 $k_v \in \{0, 1, \dots, 8\}$ 非加性调度 + 在生产级推理框架（vLLM / transformers）上的真实 TTFT/TPOT 墙钟加速与下游 MCQ/NLL 评测。

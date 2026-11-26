@@ -1,8 +1,9 @@
 {
-  "idea": "r3_loopsched_v2",
+  "idea": "r4a_ifm_fast_and_swaps",
   "assets": [
     "ifm_ouro",
     "ifm_huginn",
+    "inkling2_mini",
     "datasets",
     "arc_challenge",
     "arc_easy",

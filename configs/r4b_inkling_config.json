@@ -1,0 +1,18 @@
+{
+  "idea": "r4b_inkling2_loopsched",
+  "assets": [
+    "inkling2_mini",
+    "datasets",
+    "arc_challenge",
+    "arc_easy",
+    "openbookqa"
+  ],
+  "need_xllm": false,
+  "preferred_gpu": null,
+  "local_dir": "thinkingmachines__Inkling-2-Mini",
+  "seed": 20261126,
+  "seq_len": 256,
+  "n_calib_a": 16,
+  "n_calib_b": 8,
+  "n_eval": 64
+}

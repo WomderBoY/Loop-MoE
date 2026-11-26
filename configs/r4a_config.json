@@ -1,0 +1,30 @@
+{
+  "idea": "r4a_ifm_fast_and_swaps",
+  "assets": [
+    "ifm_ouro",
+    "ifm_huginn",
+    "inkling2_mini",
+    "datasets",
+    "arc_challenge",
+    "arc_easy",
+    "openbookqa"
+  ],
+  "need_xllm": true,
+  "preferred_gpu": null,
+  "seed": 20261126,
+  "seq_len": 256,
+  "n_calib_a": 16,
+  "n_calib_b": 8,
+  "n_eval": 64,
+  "n_arc_c": 0,
+  "n_arc_e": 600,
+  "n_obqa": 500,
+  "models": {
+    "ouro_moe": {
+      "local_dir": "IFM__LoopedLM-P1-moe-ouro-500b"
+    },
+    "huginn_moe": {
+      "local_dir": "IFM__LoopedLM-P1-moe-huginn-500b"
+    }
+  }
+}
