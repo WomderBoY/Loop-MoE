@@ -50,22 +50,26 @@ if [[ -x "$UV_BIN" ]]; then
   if ! "$UV_BIN" pip install --python "$ENV_DIR/bin/python" \
       "vllm>=0.35.0" "transformers>=5.24.0" huggingface_hub pyarrow numpy safetensors nvidia-ml-py \
       --index-url "$PIP_INDEX" 2>/dev/null; then
-    echo "[inkling-setup] Stable mirror <0.35.0; installing vLLM nightly via uv..."
+    echo "[inkling-setup] Stable mirror <0.35.0; installing vLLM nightly via uv (Tsinghua + NJU CERNET PyTorch cu130)..."
+    "$UV_BIN" pip install --python "$ENV_DIR/bin/python" --prerelease=allow \
+      --index-strategy unsafe-best-match \
+      vllm "transformers>=5.24.0" huggingface_hub pyarrow numpy safetensors nvidia-ml-py \
+      --index-url "$PIP_INDEX" \
+      --extra-index-url "https://mirrors.nju.edu.cn/pytorch/whl/cu130" \
+      --extra-index-url "$VLLM_NIGHTLY_INDEX" || \
     "$UV_BIN" pip install --python "$ENV_DIR/bin/python" --prerelease=allow \
       --index-strategy unsafe-best-match \
       vllm "transformers>=5.24.0" huggingface_hub pyarrow numpy safetensors nvidia-ml-py \
       --index-url "$PIP_INDEX" \
       --extra-index-url "$VLLM_NIGHTLY_INDEX" \
-      --extra-index-url "https://mirrors.nju.edu.cn/pytorch/whl/cu130" \
       --extra-index-url "https://download.pytorch.org/whl/cu130"
   fi
 else
   if ! "$ENV_DIR/bin/pip" install -U "vllm>=0.35.0" -i "$PIP_INDEX" 2>/dev/null; then
     "$ENV_DIR/bin/pip" install -U --pre vllm \
       -i "$PIP_INDEX" \
-      --extra-index-url "$VLLM_NIGHTLY_INDEX" \
       --extra-index-url "https://mirrors.nju.edu.cn/pytorch/whl/cu130" \
-      --extra-index-url "https://download.pytorch.org/whl/cu130"
+      --extra-index-url "$VLLM_NIGHTLY_INDEX"
   fi
   "$ENV_DIR/bin/pip" install -U -i "$PIP_INDEX" \
     "transformers>=5.24.0" huggingface_hub pyarrow numpy safetensors nvidia-ml-py
