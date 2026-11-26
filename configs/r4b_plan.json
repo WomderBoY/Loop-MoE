@@ -1,0 +1,11 @@
+{
+  "plan": [
+    {"phase": "setup", "of": 1, "unit": "env"},
+    {"phase": "download", "of": 1, "unit": "assets"},
+    {"phase": "inkling_verify_geom", "of": 2, "unit": "checks"},
+    {"phase": "inkling_calib", "of": 5, "unit": "steps"},
+    {"phase": "inkling_eval", "of": 18, "unit": "conds"},
+    {"phase": "inkling_speed", "of": 7, "unit": "scheds"},
+    {"phase": "report", "of": 1, "unit": "file"}
+  ]
+}
