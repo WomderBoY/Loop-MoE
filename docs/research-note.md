@@ -34,19 +34,17 @@ $$\frac{\text{MSE}_{\text{renorm}}}{\text{MSE}_{\text{noren}}} = 1 + \frac{\math
 
 针对 R3 暴露的两大核心工程与算法机会，Round 4 双轨并进：
 
-### 轨道 A（IFM Ouro-MoE & Huginn-MoE）：CUDA Graph + Triton Fused-MoE + 分层 `k=0/k=2` 置换帕累托
-1. **消除 Eager Python 派发瓶颈（`loop_research/ifm_fast_engine.py`）**：
-   - 零权重格式转换直接复用原生 `xllm` GPU 权重；
-   - 实现 **Triton 融合 GroupRMSNorm** + **Triton 零拷贝索引专家 SwiGLU 解码核（`triton_indexed_moe_swiglu`）**（直接按 `exp_ids` 原地索引 `weight1/2/3`，彻底消除 `index_select` 权重拷贝与 `.tolist()` 同步！）+ 原生零额外开销的 `k_v ∈ {0, 1, 2}` 静态路由；
-   - 使用 **静态 `torch.cuda.CUDAGraph`** 捕获整次 112 轮前向，在完全公平的 CUDA Graph 基线下测量 `bf16_base` vs `LoopSched` 的真实端到端 Decode (`B=1, 8, 32`) 与 Prefill (`B=8, L=256`) 加速。
-2. **修复分层候选池 + 显式扫描 `k=0/k=2` 置换对数 $m$（`loop_research/r4a_ifm_fast_and_swaps.py`）**：
-   - 将候选池改为按循环阶段分层抽样（确保 Huginn `loop_2..6` 充分进入候选池，突破 R3 仅 1 组置换的局限）；
-   - 在精确 `-50%` 预算下显式扫描置换组数 $m \in \{0, 2, 4, 6, 8, 12, 16\}$（含非相邻 `k=0` 约束），绘制完整的 **真实 GPU 延迟 vs 质量（NLL & 2,272 MCQ）二维帕累托前沿**；
-   - 将非加性迭代贪心推广至 `-25%`、`-37.5%` 纯 `k∈{1,2}` 调度，检验在 Ouro-MoE 上是否同样全面超越 `Layer-Only`。
+### 轨道 A（IFM Ouro-MoE & Huginn-MoE，**已完成**：run `4e9bc3a4`）
+1. **零转换 CUDA Graph + Triton Fused-MoE 彻底逆转 `-50%` 倒挂**：
+   - `top1_match=True`, `cudagraph_ok=True`, `replay_diff=0.00e+00`；`decode B=1` 原生 eager `xllm` 基线延迟从 `269.22 ms -> 22.87 ms`（Ouro, **11.77×**）和 `254.55 ms -> 23.13 ms`（Huginn, **11.01×**）。
+   - 相对 CUDA-Graph 基线的严格同口径算法加速：`-50% m=0` 纯 `k=1` 达 **`1.205×` (B=1) / `1.260×` (B=8) / `1.445×` (B=32) / `1.176×` (Prefill)**（Ouro）与 **`1.203× / 1.261× / 1.455× / 1.122×`**（Huginn）；`-50% m=16` 升至 **`1.252×` (B=1) / `1.497×` (B=32) / `1.292×` (Prefill)**；`-62.5%` 达 **`1.373×` (B=1) / `1.761×` (B=32, 994 tok/s) / `1.469×` (Prefill)**。
+2. **分层 `k=0/k=2` 置换帕累托与 Top-2 `k=1→0` 悬崖发现**：
+   - 在固定 `-50%` 激活 FLOPs 下，随 $m$ 增大延迟单调降低（`k=0` 跳过整层 router + MoE kernel）。
+   - **Ouro-MoE（`best_m=2` 双赢甜点）**：`m=2` 相对 `m=0` 既更快，又同时显著优于 `m=0`（ΔNLL `+0.1782` vs `+0.2285`，CI `[+0.0376, +0.0642]`；Avg MCQ `53.9%` vs `52.3%`，`+1.63 pp` CI `[+0.53, +2.77]`，相对 `renorm` 高 `+3.26 pp`）。
+   - **Huginn-MoE（`best_m=3` 揭示 Top-2 悬崖）**：`m=3` 将 ΔNLL 从 `+0.2161` 压低至 `+0.1327`（`+0.0834`，58/64 胜），但在 MCQ 上 `m=3`（`51.5%`）略低于纯 `k=1` `m=0`（`52.7%`），原因在于 Top-2 架构下 `k=1→0` 是 100% 路由专家清零断崖，仅用 WikiText 校准会强化 Coda 似然而削弱中段推理循环。
 
-### 轨道 B（新模型 `thinkingmachines/Inkling-2-Mini`）：广义 Top-$8 \to k_v$ 调度与生产级 vLLM 加速
-- **架构亮点**：26.4B Looped Sparse MoE（6 prelude + 12 循环层 × 3 轮 + 6 coda = 48 逻辑层），**128 专家 Top-8，`n_shared_experts = 0`**，原生 **NVFP4 + MXFP8**（19.5 GB 单文件，完美契合 Blackwell RTX PRO 5000），获得 vLLM (`>=0.35.0`) / SGLang Day-0 原生支持。
-- **核心研究验证（`loop_research/r4b_inkling2_loopsched.py`）**：
-  1. 将正交专家收缩定理推广至一般 Top-$K \to k$（$K=8, k \in \{1..7\}$）；
-  2. 测量 48 逻辑访问的逐轮几何与敏感度分布（Prelude vs Pass 0/1/2 vs Coda）；
-  3. 细粒度逐访问 $k_v \in \{0, 1, \dots, 8\}$ 非加性调度 + 在生产级推理框架（vLLM / transformers）上的真实 TTFT/TPOT 墙钟加速与下游 MCQ/NLL 评测。
+### 轨道 B（新模型 `thinkingmachines/Inkling-2-Mini`，**进行中**：`loop_research/inkling2_vllm_hook.py` + `r4b_inkling2_loopsched.py`）
+- **核心动机（直接回应轨道 A 发现的 Top-2 `k=0` 悬崖）**：26.4B Looped Sparse MoE（6 prelude + 12 循环层 × 3 轮 + 6 coda = 48 逻辑层），**128 专家 Top-8，`n_shared_experts = 0`**，原生 **NVFP4 + MXFP8**（19.5 GB 单文件）。Top-8 使得每访问具备细粒度 $k_v \in \{1..8\}$ 分配空间，完全无需 `k=0` 断崖，且 0 共享专家带来更高的真实端到端加速上限。
+- **生产级 vLLM 接入（SM120 Blackwell NVFP4/MXFP8 + 完整 CUDA Graph）**：
+  1. 在类级别无侵入挂钩 `vllm.models.inkling2.nvidia.moe.Inkling2MoE.forward`，通过自定义 Triton 路由核（`_select_top8_keep_k_kernel` + `_scatter_general_kernel`）直接复用 vLLM 原生 `bmm_sm120` NVFP4/MXFP8 算子与 `combine`，支持任意 $k_v \in \{0..8\}$（含非 2 的幂 `3/5/6/7`）+ 精确 `NoRen` / $\gamma_{v,k}^*$ 收缩，完全兼容生产级 vLLM CUDA Graph；
+  2. 全量验证 48 访问 × $k \in \{1..7\}$ 广义正交收缩几何、`NoRen` vs `Renorm` vs `Opt γ*`、物理层 `Layer-Only` vs 循环阶段 `Stage-Static` vs 非加性 `IterGreedy` 在 `-25%/-37.5%/-50%/-62.5%/-75%` 全谱上的 64 NLL + 2,272 MCQ 质量与生产级 vLLM 端到端 Decode (`B=1/8/32`) / Prefill (`B=8×256`) 加速。

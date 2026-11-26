@@ -4,11 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-$HOME/loop-moe-env/bin/python}"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  PYTHON_BIN="$(command -v python3)"
-fi
-
 if [[ -d /data1/shared && -w /data1/shared ]]; then
   STORAGE_BASE="/data1/shared/${USER}"
 else
@@ -37,9 +32,11 @@ mkdir -p "$OUT_DIR" "$MODEL_DIR" "$DATASET_DIR" "$HF_HOME"
 
 report() { printf '::orx:: %s\n' "$1"; }
 
-IDEA="$("$PYTHON_BIN" -c "import json,sys; print(json.load(open(sys.argv[1]))['idea'])" "$CONFIG_PATH")"
-ASSETS="$("$PYTHON_BIN" -c "import json,sys; print(','.join(json.load(open(sys.argv[1])).get('assets', [])))" "$CONFIG_PATH")"
-NEED_XLLM="$("$PYTHON_BIN" -c "import json,sys; print(1 if json.load(open(sys.argv[1])).get('need_xllm', False) else 0)" "$CONFIG_PATH")"
+# Parse config with system python3 before selecting the experiment-specific venv
+SYS_PY="$(command -v python3)"
+IDEA="$("$SYS_PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['idea'])" "$CONFIG_PATH")"
+ASSETS="$("$SYS_PY" -c "import json,sys; print(','.join(json.load(open(sys.argv[1])).get('assets', [])))" "$CONFIG_PATH")"
+NEED_XLLM="$("$SYS_PY" -c "import json,sys; print(1 if json.load(open(sys.argv[1])).get('need_xllm', False) else 0)" "$CONFIG_PATH")"
 
 echo "[run] ROOT_DIR=$ROOT_DIR"
 echo "[run] CONFIG_PATH=$CONFIG_PATH"
@@ -48,11 +45,23 @@ echo "[run] OUT_DIR=$OUT_DIR"
 echo "[run] GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo snapshot)"
 
 report '{"phase":"setup","step":0,"of":1,"unit":"env"}'
-NEED_XLLM="$NEED_XLLM" bash scripts/setup_env.sh
+if [[ "$IDEA" == "r4b_inkling2_loopsched" ]]; then
+  INKLING_ENV_DIR="${INKLING_ENV_DIR:-$HOME/inkling-vllm-env}"
+  bash scripts/setup_inkling_env.sh
+  PYTHON_BIN="${PYTHON_BIN:-$INKLING_ENV_DIR/bin/python}"
+  export PYTHON_BIN
+else
+  PYTHON_BIN="${PYTHON_BIN:-$HOME/loop-moe-env/bin/python}"
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    PYTHON_BIN="$SYS_PY"
+  fi
+  export PYTHON_BIN
+  NEED_XLLM="$NEED_XLLM" bash scripts/setup_env.sh
+fi
 report '{"step":1}'
 
 report '{"phase":"download","step":0,"of":1,"unit":"assets"}'
-ASSETS="$ASSETS" bash scripts/download_assets.sh
+ASSETS="$ASSETS" PYTHON_BIN="$PYTHON_BIN" bash scripts/download_assets.sh
 report '{"step":1}'
 
 if [[ "$IDEA" == "r2a_loopsched_moe" ]]; then

@@ -12,7 +12,18 @@
   "local_dir": "thinkingmachines__Inkling-2-Mini",
   "seed": 20261126,
   "seq_len": 256,
-  "n_calib_a": 16,
-  "n_calib_b": 8,
-  "n_eval": 64
+  "n_diag": 4,
+  "n_calib_a": 12,
+  "n_calib_b": 6,
+  "n_eval": 64,
+  "mcq_limits": {
+    "arc_challenge": 1172,
+    "arc_easy": 600,
+    "openbookqa": 500
+  },
+  "max_model_len": 2048,
+  "gpu_memory_utilization": 0.72,
+  "speed_decode_tokens": 32,
+  "speed_warmup": 3,
+  "speed_iters": 12
 }

@@ -27,18 +27,20 @@
 │   ├── experiment.json                 # 当前默认运行配置（由 scripts/run_experiment.sh 读取）
 │   ├── r2a_config.json / r2a_view.xml  # Round 2-A 复现配置
 │   ├── r3_config.json / r3_view.xml    # Round 3 复现配置
-│   └── r4a_config.json / r4a_view.xml  # Round 4-A（IFM CUDA-Graph + Triton + 分层置换扫描）配置
+│   ├── r4a_config.json / r4a_view.xml  # Round 4-A（IFM CUDA-Graph + Triton + 分层置换扫描）配置
+│   └── r4b_inkling_config.json / r4b_view.xml # Round 4-B（Inkling-2-Mini 生产级 vLLM Top-8->k_v 调度）配置
 ├── docs/
 │   └── research-note.md                # 核心定理、已验证实证结论与 Round 4 设计笔记
 ├── loop_research/
 │   ├── gpu_utils.py                    # 空闲 GPU 安全选择器（严格避开他人占用显卡 + 文件锁）
-│   ├── data_assets.py                  # 国内镜像模型与数据集下载 + 确定性切分/MCQ 加载器
+│   ├── data_assets.py                  # 国内镜像模型与数据集下载（含 16 线程 ModelScope CDN）+ 确定性切分/MCQ 加载器
 │   ├── ifm_runtime.py                  # IFM xllm-loop 加载器与 SM120 纯 PyTorch 垫片
 │   ├── ifm_fast_engine.py              # IFM 零转换 Triton Fused-MoE + CUDA Graph 推理加速引擎
+│   ├── inkling2_vllm_hook.py           # Inkling-2-Mini 生产级 vLLM SM120 NVFP4/MXFP8 Triton Top-8->k_v + NoRen 挂钩
 │   ├── r2a_loopsched_moe.py            # Round 2-A 完整复现脚本
 │   ├── r3_loopsched_v2.py              # Round 3 完整复现脚本
 │   ├── r4a_ifm_fast_and_swaps.py       # Round 4-A：CUDA-Graph 真实加速 + 分层 IterGreedy + m 组置换扫描
-│   ├── r4b_inkling2_loopsched.py       # Round 4-B：Inkling-2-Mini Top-8->k_v 调度与 vLLM 加速验证
+│   ├── r4b_inkling2_loopsched.py       # Round 4-B：Inkling-2-Mini Top-8->k_v 调度与生产级 vLLM CUDA-Graph 加速验证
 │   └── orx_run.py                      # 标准化进度与指标上报模块
 ├── scripts/
 │   ├── setup_env.sh                    # IFM 主环境校验与依赖安装（清华镜像源）
@@ -85,8 +87,11 @@ ASSETS="inkling2_mini" bash scripts/download_assets.sh
 ### 3. 运行实验与复现命令
 
 ```bash
-# 运行当前默认实验（Round 4-A：IFM CUDA-Graph + Triton 加速 + 分层 IterGreedy + 多组置换扫描）
+# 运行当前默认实验（Round 4-B：Inkling-2-Mini 生产级 vLLM Top-8->k_v 调度与加速，自动切换独立 inkling-vllm-env）
 bash scripts/run_experiment.sh
+
+# 复现 Round 4-A（IFM Ouro-MoE + Huginn-MoE CUDA-Graph + Triton + 分层 m 组置换扫描）
+CONFIG_PATH=configs/r4a_config.json bash scripts/run_experiment.sh
 
 # 仅下载新模型并检测空闲卡（若全部显卡被占用则优雅退出，不阻塞也不抢卡）
 EXIT_IF_NO_IDLE_GPU=1 bash scripts/run_experiment.sh
@@ -94,12 +99,8 @@ EXIT_IF_NO_IDLE_GPU=1 bash scripts/run_experiment.sh
 # 复现 Round 3 全部 24 组条件结果
 CONFIG_PATH=configs/r3_config.json bash scripts/run_experiment.sh
 
-# 运行 Round 4-B（Inkling-2-Mini Top-8->k_v 调度与生产级推理加速，使用独立 inkling 环境）
-PYTHON_BIN="$HOME/inkling-vllm-env/bin/python" \
-  CONFIG_PATH=configs/r4b_inkling_config.json bash scripts/run_experiment.sh
-
-# 手动指定空闲卡号（如 GPU 6）
-LOOP_GPU_INDEX=6 bash scripts/run_experiment.sh
+# 手动指定空闲卡号（如 GPU 4）
+LOOP_GPU_INDEX=4 bash scripts/run_experiment.sh
 ```
 
 ### 4. 本机轻量代码与单元测试检查（MacBook CPU）

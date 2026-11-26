@@ -18,11 +18,14 @@ from loop_research.r4a_ifm_fast_and_swaps import (
     build_stratified_k0_order,
     solve_stratified_swap_pareto_and_full_spectrum,
 )
+from loop_research.inkling2_vllm_hook import Inkling2LoopSchedController
 from loop_research.r4b_inkling2_loopsched import (
     build_inkling2_topology,
     build_stage_schedule_inkling2,
     generalized_shrinkage_stats,
     solve_general_topk_iter_greedy,
+    solve_layer_only_topk_schedule,
+    solve_stage_static_topk,
 )
 
 
@@ -252,6 +255,32 @@ class TestR4FastAndInkling(unittest.TestCase):
         # Deterministic stage schedule check
         vk_st = build_stage_schedule_inkling2(topo, {"prelude": 8, "pass_0": 4, "pass_1": 2, "pass_2": 4, "coda": 8})
         self.assertEqual(sum(vk_st), 6 * 8 + 12 * 4 + 12 * 2 + 12 * 4 + 6 * 8)
+
+        # Layer-only ablation MUST assign identical k across all 3 passes of every looped physical layer [6..17]!
+        visit_sens = np.array([5.0 if not t["is_rec"] else (0.1 if t["stage"] == "pass_1" else 1.0) for t in topo])
+        vk_lo = solve_layer_only_topk_schedule(topo, visit_sens, K_max=8, target_cut_frac=0.50, min_k=1)
+        self.assertEqual(sum(vk_lo), 192)
+        for lid in range(6, 18):
+            vids = [t["vid"] for t in topo if t["layer_id"] == lid]
+            self.assertEqual(len(set(vk_lo[v] for v in vids)), 1)
+
+        # Stage-static solver check
+        vk_ss = solve_stage_static_topk(
+            topo, {"prelude": 3.0, "pass_0": 0.4, "pass_1": 0.1, "pass_2": 0.6, "coda": 2.5}, K_max=8, target_cut_frac=0.50
+        )
+        self.assertEqual(sum(vk_ss), 192)
+        self.assertGreater(vk_ss[0], vk_ss[18])  # prelude > pass_1
+
+        # Inkling2LoopSchedController exact diagnostic accumulation parity vs generalized_shrinkage_stats!
+        ctrl = Inkling2LoopSchedController(num_visits=48, k_max=8)
+        ctrl.start_diagnostics()
+        u_weighted = w.unsqueeze(-1) * e  # [N, 8, D]
+        ctrl.accumulate_visit_diag(12, w[:100], u_weighted[:100])
+        ctrl.accumulate_visit_diag(12, w[100:], u_weighted[100:])
+        summary = ctrl.stop_diagnostics()
+        self.assertAlmostEqual(summary[12][4]["gamma_opt"], st4["gamma_opt"], places=5)
+        self.assertAlmostEqual(summary[12][4]["mse_ratio_ren_vs_noren"], st4["mse_ratio_ren_vs_noren"], places=4)
+        self.assertAlmostEqual(summary[12][4]["cos_kept_dropped"], st4["cos_kept_dropped"], places=5)
 
     def test_fast_range_downloader_bit_exact_and_shard_check(self):
         import http.server

@@ -1,0 +1,28 @@
+<signal name="inkling_cg_b1_cut50_speedup" label="Inkling vLLM CG B=1 (-50%) Speedup" unit="x" digits="3" better="higher" />
+<signal name="inkling_cg_b32_cut50_speedup" label="Inkling vLLM CG B=32 (-50%) Speedup" unit="x" digits="3" better="higher" />
+<signal name="inkling_cg_b32_cut75_speedup" label="Inkling vLLM CG B=32 (-75%) Speedup" unit="x" digits="3" better="higher" />
+<signal name="inkling_cut50_noren_vs_renorm_nll" label="Inkling -50% NoRen vs Renorm NLL" digits="4" better="higher" sign="true" />
+<signal name="inkling_cut50_iter_vs_unif_nll" label="Inkling -50% LoopSched vs Unif NLL" digits="4" better="higher" sign="true" />
+<signal name="inkling_cut50_iter_vs_renorm_mcq" label="Inkling -50% LoopSched vs Renorm MCQ" unit="pp" digits="2" better="higher" sign="true" />
+<signal name="latest_avg_mcq" label="Latest Avg MCQ" scale="100" unit="%" digits="1" better="higher" />
+<signal name="latest_dnll" label="Latest ΔNLL" digits="4" better="lower" sign="true" />
+<signal name="latest_b1_speedup" label="Latest CG Decode B=1 Speedup" unit="x" digits="3" better="higher" />
+<signal name="policy" label="Policy" />
+<signal name="cut_pct" label="Active Cut" unit="%" digits="1" />
+<signal name="delta_nll" label="ΔNLL vs Base" digits="4" better="lower" sign="true" />
+<signal name="arc_c" label="ARC-C (1172)" scale="100" unit="%" digits="1" better="higher" />
+<signal name="arc_e" label="ARC-E (600)" scale="100" unit="%" digits="1" better="higher" />
+<signal name="obqa" label="OBQA (500)" scale="100" unit="%" digits="1" better="higher" />
+<signal name="avg_mcq" label="Avg MCQ (2272)" scale="100" unit="%" digits="1" better="higher" />
+<signal name="shape" label="Shape" />
+<signal name="schedule" label="Schedule" />
+<signal name="median_ms" label="Latency" unit="ms" digits="2" better="lower" />
+<signal name="speedup" label="Speedup" unit="x" digits="3" better="higher" />
+<signal name="tok_per_sec" label="Throughput" unit="tok/s" digits="0" better="higher" />
+
+<view headline="inkling_cg_b32_cut50_speedup inkling_cut50_iter_vs_renorm_mcq latest_avg_mcq">
+  <stats of="inkling_cg_b1_cut50_speedup inkling_cg_b32_cut50_speedup inkling_cg_b32_cut75_speedup inkling_cut50_noren_vs_renorm_nll inkling_cut50_iter_vs_unif_nll inkling_cut50_iter_vs_renorm_mcq" vs="final" />
+  <chart from="inkling_speed" x="cut_pct" y="speedup" by="shape" mark="points" title="Inkling-2-Mini Real Production vLLM Speedup (CUDA Graph NVFP4)" />
+  <table name="inkling_results" columns="policy cut_pct delta_nll arc_c arc_e obqa avg_mcq" phase="inkling_eval" title="Inkling-2-Mini Quality Results (64 NLL + 2,272 MCQ)" />
+  <table name="inkling_speed" columns="shape schedule cut_pct median_ms speedup tok_per_sec" phase="inkling_speed" title="Inkling-2-Mini Production vLLM Wall-Clock Speedups" />
+</view>
