@@ -49,6 +49,7 @@ if [[ "$IDEA" == "r4b_inkling2_loopsched" ]]; then
   INKLING_ENV_DIR="${INKLING_ENV_DIR:-$HOME/inkling-vllm-env}"
   bash scripts/setup_inkling_env.sh
   PYTHON_BIN="${PYTHON_BIN:-$INKLING_ENV_DIR/bin/python}"
+  export PATH="$INKLING_ENV_DIR/bin:$PATH"
   export PYTHON_BIN
 else
   PYTHON_BIN="${PYTHON_BIN:-$HOME/loop-moe-env/bin/python}"
