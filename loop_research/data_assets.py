@@ -52,6 +52,214 @@ MODEL_REPOS: dict[str, tuple[str, str]] = {
     "inkling2_mini": ("thinkingmachines/Inkling-2-Mini", "thinkingmachines__Inkling-2-Mini"),
 }
 
+# Models with verified high-speed ModelScope Alibaba Cloud CDN mirrors for large weight shards
+MODELSCOPE_LARGE_SHARDS: dict[str, list[tuple[str, int]]] = {
+    "inkling2_mini": [
+        ("model-00001-of-00001.safetensors", 19526019168),
+        ("mtp.safetensors", 635801416),
+    ],
+}
+
+
+def _probe_remote_range_size(url: str, timeout: int = 15) -> int:
+    """Probe exact remote file size via HTTP Range: bytes=0-0 (works through 302 CDN redirects)."""
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "loop-moe-downloader/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        cr = resp.headers.get("Content-Range", "")
+        m = re.search(r"/(\d+)\s*$", cr)
+        if m:
+            return int(m.group(1))
+        cl = resp.headers.get("Content-Length")
+        if cl and resp.status == 200:
+            return int(cl)
+    raise RuntimeError(f"Could not determine remote file size via Range probe for {url}")
+
+
+def fast_range_download_file(
+    urls: list[str],
+    dest: Path,
+    *,
+    num_workers: int = 16,
+    chunk_size_bytes: int = 16 * 1024 * 1024,
+    expected_size: int | None = None,
+    log_interval_sec: float = 5.0,
+) -> Path:
+    """High-speed resumable multi-connection HTTP Range downloader (os.pwrite, zero RAM blowup).
+
+    Tries each URL in `urls` in order (e.g., ModelScope Alibaba Cloud CDN first, then hf-mirror).
+    Logs live throughput (MB/s) and ETA every `log_interval_sec` seconds.
+    """
+    import concurrent.futures
+    import threading
+    import time
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file() and expected_size is not None and dest.stat().st_size == expected_size:
+        print(f"[download] Fast shard already cached: {dest.name} ({expected_size / (1024**3):.2f} GiB)", flush=True)
+        return dest
+
+    chosen_url: str | None = None
+    total_size: int = 0
+    last_err: Exception | None = None
+    for u in urls:
+        try:
+            sz = _probe_remote_range_size(u)
+            if expected_size is not None and sz != expected_size:
+                print(f"[download] Warning: {u} size {sz} != expected {expected_size}; trying next mirror.", flush=True)
+                continue
+            chosen_url = u
+            total_size = sz
+            break
+        except Exception as exc:
+            last_err = exc
+            print(f"[download] Probe failed for {u}: {exc}", flush=True)
+
+    if chosen_url is None:
+        raise RuntimeError(f"All mirrors failed Range probe for {dest.name}: {last_err}")
+
+    if dest.is_file() and dest.stat().st_size == total_size:
+        print(f"[download] Fast shard already cached: {dest.name} ({total_size / (1024**3):.2f} GiB)", flush=True)
+        return dest
+
+    part_path = dest.with_name(dest.name + ".part")
+    state_path = dest.with_name(dest.name + ".chunks.json")
+
+    chunks: list[tuple[int, int, int]] = []
+    cid = 0
+    for start in range(0, total_size, chunk_size_bytes):
+        end = min(total_size - 1, start + chunk_size_bytes - 1)
+        chunks.append((cid, start, end))
+        cid += 1
+
+    done_ids: set[int] = set()
+    if part_path.is_file() and state_path.is_file():
+        try:
+            st = json.loads(state_path.read_text(encoding="utf-8"))
+            if st.get("total_size") == total_size and st.get("chunk_size") == chunk_size_bytes:
+                done_ids = set(int(i) for i in st.get("done", []))
+        except Exception:
+            done_ids = set()
+
+    # Pre-create / open sparse part file for parallel os.pwrite
+    fd = os.open(str(part_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        os.ftruncate(fd, total_size)
+        pending = [c for c in chunks if c[0] not in done_ids]
+        already_bytes = sum((e - s + 1) for i, s, e in chunks if i in done_ids)
+        print(
+            f"[download] Fast {num_workers}-thread Range download: {dest.name} "
+            f"({total_size / (1024**3):.2f} GiB, {len(done_ids)}/{len(chunks)} chunks cached) <- {chosen_url}",
+            flush=True,
+        )
+
+        lock = threading.Lock()
+        bytes_new = 0
+        t_start = time.monotonic()
+        t_last = t_start
+        stop_flag = threading.Event()
+
+        def save_state() -> None:
+            tmp_st = state_path.with_name(state_path.name + ".tmp")
+            tmp_st.write_text(
+                json.dumps({"total_size": total_size, "chunk_size": chunk_size_bytes, "done": sorted(done_ids)}),
+                encoding="utf-8",
+            )
+            os.replace(tmp_st, state_path)
+
+        def download_chunk(item: tuple[int, int, int]) -> None:
+            nonlocal bytes_new, t_last
+            chunk_id, s_off, e_off = item
+            want = e_off - s_off + 1
+            for attempt in range(6):
+                if stop_flag.is_set():
+                    return
+                try:
+                    req = urllib.request.Request(
+                        chosen_url,
+                        headers={"Range": f"bytes={s_off}-{e_off}", "User-Agent": "loop-moe-downloader/1.0"},
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        buf = bytearray()
+                        while len(buf) < want:
+                            blk = resp.read(min(1024 * 1024, want - len(buf)))
+                            if not blk:
+                                break
+                            buf.extend(blk)
+                    if len(buf) != want:
+                        raise IOError(f"Short read chunk {chunk_id}: got {len(buf)}/{want}")
+                    # Positional write directly to offset (thread-safe POSIX pwrite)
+                    written = 0
+                    mv = memoryview(buf)
+                    while written < want:
+                        n_w = os.pwrite(fd, mv[written:], s_off + written)
+                        if n_w <= 0:
+                            raise IOError(f"pwrite returned {n_w}")
+                        written += n_w
+                    with lock:
+                        done_ids.add(chunk_id)
+                        bytes_new += want
+                        now = time.monotonic()
+                        if now - t_last >= log_interval_sec or len(done_ids) == len(chunks):
+                            t_last = now
+                            cur_tot = already_bytes + bytes_new
+                            pct = 100.0 * cur_tot / max(total_size, 1)
+                            rate_mb = (bytes_new / (1024.0 * 1024.0)) / max(now - t_start, 1e-3)
+                            rem_s = ((total_size - cur_tot) / (1024.0 * 1024.0)) / max(rate_mb, 1e-3)
+                            print(
+                                f"[download] {dest.name}: {cur_tot / (1024**3):.2f}/{total_size / (1024**3):.2f} GiB "
+                                f"({pct:5.1f}%) | {rate_mb:5.1f} MB/s | ETA {int(rem_s // 60)}m{int(rem_s % 60):02d}s",
+                                flush=True,
+                            )
+                            save_state()
+                    return
+                except Exception as exc:
+                    if attempt == 5:
+                        stop_flag.set()
+                        raise RuntimeError(f"Chunk {chunk_id} ({s_off}-{e_off}) failed after 6 retries: {exc}") from exc
+                    time.sleep(min(2.0 * (attempt + 1), 10.0))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futs = [pool.submit(download_chunk, item) for item in pending]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+        save_state()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    if part_path.stat().st_size != total_size:
+        raise RuntimeError(f"Size mismatch after download: {part_path.stat().st_size} != {total_size}")
+    os.replace(part_path, dest)
+    if state_path.exists():
+        state_path.unlink()
+    dt = max(time.monotonic() - t_start, 1e-3)
+    print(
+        f"[download] Completed {dest.name} ({total_size / (1024**3):.2f} GiB) in {dt:.1f}s "
+        f"(avg {(bytes_new / (1024**2)) / dt:.1f} MB/s)",
+        flush=True,
+    )
+    return dest
+
+
+def _model_shards_complete(target: Path) -> bool:
+    """Verify config.json AND every shard listed in model.safetensors.index.json (if present)."""
+    if not (target / "config.json").is_file():
+        return False
+    idx_file = target / "model.safetensors.index.json"
+    if idx_file.is_file():
+        try:
+            wm = json.loads(idx_file.read_text(encoding="utf-8")).get("weight_map", {})
+            req_shards = sorted(set(wm.values()))
+            if req_shards and all((target / s).is_file() and (target / s).stat().st_size > 0 for s in req_shards):
+                return True
+            return False
+        except Exception:
+            return False
+    return any(p.stat().st_size > 0 for p in target.glob("*.safetensors"))
+
 
 def _download_dynamic_dataset(ds_key: str, ds_root: Path) -> str:
     """Download parquet/jsonl files for a dataset by querying HfApi file listing."""
@@ -120,10 +328,26 @@ def download_requested_assets(
         if asset in MODEL_REPOS:
             repo_id, local_name = MODEL_REPOS[asset]
             target = model_root / local_name
-            has_config = (target / "config.json").is_file()
-            has_weights = any(target.glob("*.safetensors"))
-            if has_config and has_weights:
+            if _model_shards_complete(target):
                 print(f"[download] Model {repo_id} already cached at {target}")
+            elif asset in MODELSCOPE_LARGE_SHARDS:
+                # 1) Fetch small config/tokenizer files quickly via snapshot_download (skip huge safetensors!)
+                target.mkdir(parents=True, exist_ok=True)
+                print(f"[download] Fetching configs/tokenizer for {repo_id} -> {target}", flush=True)
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(target),
+                    ignore_patterns=["*.png", "*.jpg", "*.gif", "*.md", "*.safetensors"],
+                )
+                # 2) Download large safetensors shards via 16-connection ModelScope Alibaba CDN (fallback: hf-mirror)
+                hf_ep = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").rstrip("/")
+                workers = int(os.environ.get("DOWNLOAD_WORKERS", "16"))
+                for fname, exp_sz in MODELSCOPE_LARGE_SHARDS[asset]:
+                    urls = [
+                        f"https://modelscope.cn/models/{repo_id}/resolve/master/{fname}",
+                        f"{hf_ep}/{repo_id}/resolve/main/{fname}",
+                    ]
+                    fast_range_download_file(urls, target / fname, num_workers=workers, expected_size=exp_sz)
             else:
                 print(f"[download] Downloading model {repo_id} -> {target} (endpoint={os.environ.get('HF_ENDPOINT', 'default')})")
                 snapshot_download(

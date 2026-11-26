@@ -253,6 +253,66 @@ class TestR4FastAndInkling(unittest.TestCase):
         vk_st = build_stage_schedule_inkling2(topo, {"prelude": 8, "pass_0": 4, "pass_1": 2, "pass_2": 4, "coda": 8})
         self.assertEqual(sum(vk_st), 6 * 8 + 12 * 4 + 12 * 2 + 12 * 4 + 6 * 8)
 
+    def test_fast_range_downloader_bit_exact_and_shard_check(self):
+        import http.server
+        import tempfile
+        import threading
+        from pathlib import Path
+        from loop_research.data_assets import _model_shards_complete, fast_range_download_file
+
+        payload = bytes((i * 131 + 7) % 256 for i in range(250_000))
+
+        class _RangeHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                rng = self.headers.get("Range", "")
+                if rng.startswith("bytes="):
+                    a_s, b_s = rng[6:].split("-")
+                    a, b = int(a_s), int(b_s)
+                    chunk = payload[a : b + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {a}-{b}/{len(payload)}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RangeHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                dest = Path(td) / "shard.safetensors"
+                fast_range_download_file(
+                    [f"http://127.0.0.1:{port}/shard.safetensors"],
+                    dest,
+                    num_workers=4,
+                    chunk_size_bytes=32_768,
+                    expected_size=len(payload),
+                    log_interval_sec=999.0,
+                )
+                self.assertEqual(dest.read_bytes(), payload)
+
+                # Verify _model_shards_complete rejects partial directory with only mtp.safetensors!
+                (Path(td) / "config.json").write_text("{}")
+                (Path(td) / "model.safetensors.index.json").write_text(
+                    '{"weight_map": {"w": "model-00001-of-00001.safetensors"}}'
+                )
+                (Path(td) / "mtp.safetensors").write_bytes(b"abc")
+                self.assertFalse(_model_shards_complete(Path(td)))
+                (Path(td) / "model-00001-of-00001.safetensors").write_bytes(b"xyz")
+                self.assertTrue(_model_shards_complete(Path(td)))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
