@@ -56,6 +56,7 @@ if [[ -x "$UV_BIN" ]]; then
       vllm "transformers>=5.24.0" huggingface_hub pyarrow numpy safetensors nvidia-ml-py \
       --index-url "$PIP_INDEX" \
       --extra-index-url "$VLLM_NIGHTLY_INDEX" \
+      --extra-index-url "https://mirrors.nju.edu.cn/pytorch/whl/cu130" \
       --extra-index-url "https://download.pytorch.org/whl/cu130"
   fi
 else
@@ -63,6 +64,7 @@ else
     "$ENV_DIR/bin/pip" install -U --pre vllm \
       -i "$PIP_INDEX" \
       --extra-index-url "$VLLM_NIGHTLY_INDEX" \
+      --extra-index-url "https://mirrors.nju.edu.cn/pytorch/whl/cu130" \
       --extra-index-url "https://download.pytorch.org/whl/cu130"
   fi
   "$ENV_DIR/bin/pip" install -U -i "$PIP_INDEX" \
