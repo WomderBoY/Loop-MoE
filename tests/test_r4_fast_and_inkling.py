@@ -23,6 +23,8 @@ from loop_research.r4b_inkling2_loopsched import (
     build_inkling2_topology,
     build_stage_schedule_inkling2,
     generalized_shrinkage_stats,
+    paired_mcnemar_test,
+    solve_convex_bounded_swap_topk,
     solve_general_topk_iter_greedy,
     solve_layer_only_topk_schedule,
     solve_stage_static_topk,
@@ -281,6 +283,68 @@ class TestR4FastAndInkling(unittest.TestCase):
         self.assertAlmostEqual(summary[12][4]["gamma_opt"], st4["gamma_opt"], places=5)
         self.assertAlmostEqual(summary[12][4]["mse_ratio_ren_vs_noren"], st4["mse_ratio_ren_vs_noren"], places=4)
         self.assertAlmostEqual(summary[12][4]["cos_kept_dropped"], st4["cos_kept_dropped"], places=5)
+
+    def test_r4c_zero_sens_bugfix_convex_swap_and_mcnemar(self):
+        topo = build_inkling2_topology(24, 6, 18, 3)
+
+        # 1. Regression test for R4-B zero-sensitivity pool lockout bug:
+        # 10 visits have exact 0.0 sensitivity, convex per-visit loss strongly penalizes k=1.
+        visit_sens = np.full(48, 0.004, dtype=np.float64)
+        for z in [0, 2, 3, 4, 6, 13, 14, 28, 34, 37]:
+            visit_sens[z] = 0.0
+
+        def convex_loss(vk: list[int]) -> float:
+            # Strongly convex in dropped experts (1/k), with gentle pass gradient (pass_0 < pass_2 < coda)
+            stage_w = {"prelude": 0.8, "pass_0": 0.6, "pass_1": 1.0, "pass_2": 1.4, "coda": 2.2}
+            return sum(stage_w[topo[v]["stage"]] * ((8.0 / max(k, 1)) - 1.0) ** 1.6 for v, k in enumerate(vk))
+
+        vk_fixed = solve_general_topk_iter_greedy(
+            convex_loss, topo, K_max=8, target_cut_frac=0.50,
+            visit_sens=visit_sens, min_k_boundary=3, min_k_rec=2,
+            step_delta_k=1, cand_pool_size=10, batch_drop_per_round=4, max_spread=2,
+        )
+        self.assertEqual(sum(vk_fixed), 192)
+        self.assertLessEqual(max(vk_fixed) - min(vk_fixed), 2)
+        self.assertGreaterEqual(min(vk_fixed), 2)
+        # Repaired IterGreedy must beat uniform k=4 on the heterogeneous convex objective!
+        self.assertLess(convex_loss(vk_fixed), convex_loss([4] * 48))
+
+        # 2. Convex-bounded +-1 swap solver from uniform k=4:
+        sw = solve_convex_bounded_swap_topk(
+            convex_loss, convex_loss, topo, K_max=8, k_bar=4,
+            max_delta=1, max_swaps=12, drop_pool=5, boost_pool=5, patience=3,
+        )
+        self.assertEqual(sum(sw["best_vk"]), 192)
+        self.assertTrue(all(3 <= k <= 5 for k in sw["best_vk"]))
+        self.assertGreater(sw["best_step"], 0)
+        self.assertLess(convex_loss(sw["best_vk"]), convex_loss([4] * 48))
+        # Coda visits must be boosted above pass_0 visits
+        coda_k = np.mean([sw["best_vk"][t["vid"]] for t in topo if t["stage"] == "coda"])
+        pass0_k = np.mean([sw["best_vk"][t["vid"]] for t in topo if t["stage"] == "pass_0"])
+        self.assertGreater(coda_k, pass0_k)
+
+        # 3. calib_b overfitting guard: if calib_a wants swaps that HURT calib_b, must revert to uniform (best_step=0)!
+        def trap_a(vk: list[int]) -> float:
+            return sum((0.1 if v < 6 else 5.0) * (4 - k) for v, k in enumerate(vk)) + 0.01 * sum((k - 4) ** 2 for k in vk)
+
+        def clean_b(vk: list[int]) -> float:
+            # Uniform k=4 is strictly optimal on calib_b!
+            return 1.0 + sum((k - 4) ** 2 for k in vk)
+
+        sw_guard = solve_convex_bounded_swap_topk(
+            trap_a, clean_b, topo, K_max=8, k_bar=4,
+            max_delta=1, max_swaps=8, drop_pool=4, boost_pool=4, patience=2,
+        )
+        self.assertEqual(sw_guard["best_step"], 0)
+        self.assertEqual(sw_guard["best_vk"], [4] * 48)
+
+        # 4. Exact paired McNemar test checks
+        m_eq = paired_mcnemar_test([1, 0, 1, 0], [0, 1, 1, 0])
+        self.assertEqual((m_eq["n10"], m_eq["n01"]), (1, 1))
+        self.assertAlmostEqual(m_eq["p_value"], 1.0, places=6)
+        m_sig = paired_mcnemar_test([1] * 20, [0] * 20)
+        self.assertEqual((m_sig["n10"], m_sig["n01"]), (20, 0))
+        self.assertLess(m_sig["p_value"], 1e-5)
 
     def test_fast_range_downloader_bit_exact_and_shard_check(self):
         import http.server

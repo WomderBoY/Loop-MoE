@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -206,6 +207,31 @@ def solve_stage_static_topk(
     return build_stage_schedule_inkling2(topo, k_stage)
 
 
+def paired_mcnemar_test(flags_a: list[int], flags_b: list[int]) -> dict[str, Any]:
+    """Exact two-sided paired McNemar binomial test on matched 0/1 item correctness flags.
+
+    Counts discordant pairs:
+      n10 = items where A is correct (1) and B is wrong (0)
+      n01 = items where A is wrong (0) and B is correct (1)
+    Returns exact two-sided binomial p-value under H0: p = 0.5 (pure stdlib math.lgamma).
+    """
+    assert len(flags_a) == len(flags_b)
+    n10 = sum(1 for a, b in zip(flags_a, flags_b) if int(a) == 1 and int(b) == 0)
+    n01 = sum(1 for a, b in zip(flags_a, flags_b) if int(a) == 0 and int(b) == 1)
+    n = n10 + n01
+    if n == 0:
+        return {"n10": 0, "n01": 0, "p_value": 1.0}
+    k = min(n10, n01)
+    log_half_n = -n * math.log(2.0)
+    lgamma_n1 = math.lgamma(n + 1)
+    tail = 0.0
+    for i in range(k + 1):
+        log_p = lgamma_n1 - math.lgamma(i + 1) - math.lgamma(n - i + 1) + log_half_n
+        tail += math.exp(log_p)
+    p_val = min(1.0, 2.0 * tail)
+    return {"n10": int(n10), "n01": int(n01), "p_value": float(p_val)}
+
+
 def solve_general_topk_iter_greedy(
     eval_a_fn,
     topo: list[dict[str, Any]],
@@ -220,12 +246,15 @@ def solve_general_topk_iter_greedy(
     cand_pool_size: int = 12,
     start_vk: list[int] | None = None,
     batch_drop_per_round: int = 1,
+    max_spread: int | None = None,
 ) -> list[int]:
-    """Non-additive iterative greedy solver over general per-visit k_v in {1, ..., K_max}.
+    """Repaired non-additive iterative greedy solver over general per-visit k_v in {1, ..., K_max}.
 
-    Unlike IFM Top-2 (where k=1->0 removes 100% of routed experts), Top-8 allows smooth
-    fine-grained steps (8->7->...->2->1) protecting sensitive stages while aggressively thinning
-    redundant passes with ZERO k=0 cliffs!
+    Fixes the R4-B zero-sensitivity pool lockout bug:
+      1. Strictly positive `sens_floor` prevents zero-clamped visits from permanently hogging
+         `cand_pool_size` until hitting `k=1` while untouched visits stay at `k=8`.
+      2. Optional `max_spread` enforces convex level-balancing (`max(vk) - min(vk) <= max_spread`)
+         so strongly convex Top-8 truncation never collapses a subset of visits to `k=1`.
     """
     V = len(topo)
     total_slots = V * K_max
@@ -237,9 +266,15 @@ def solve_general_topk_iter_greedy(
         for idx, st in enumerate(stage_priority_order):
             stage_rank[st] = idx
 
+    # Strictly positive sensitivity floor eliminates the R4-B `0.0 * ((dropped + 1)**p) == 0.0` lockout!
+    sens_floor = 1e-4
+    if visit_sens is not None:
+        pos_vals = [float(x) for x in visit_sens if float(x) > 1e-6]
+        if pos_vals:
+            sens_floor = max(1e-4, 0.25 * float(np.median(pos_vals)))
+
     def _visit_priority(v: int) -> tuple:
-        # Favor visits with lower marginal sensitivity and more remaining budget
-        sens = float(visit_sens[v]) if visit_sens is not None else 0.0
+        sens = max(float(visit_sens[v]), sens_floor) if visit_sens is not None else 1.0
         return (
             0 if topo[v]["is_rec"] else 1,
             stage_rank.get(topo[v]["stage"], 99),
@@ -253,16 +288,23 @@ def solve_general_topk_iter_greedy(
         rem = sum(vk) - target_slots
         dk = min(step_delta_k, rem)
 
-        # Dynamic priority: scale sensitivity by how much already dropped so we explore diverse visits
         def _dyn_key(v: int) -> tuple:
             dropped_v = K_max - vk[v]
-            sens = float(visit_sens[v]) if visit_sens is not None else float(stage_rank.get(topo[v]["stage"], 5) + 1)
-            return (sens * ((dropped_v + 1.0) ** 0.75), base_order.index(v))
+            if visit_sens is not None:
+                sens = max(float(visit_sens[v]), sens_floor)
+            else:
+                sens = float(stage_rank.get(topo[v]["stage"], 5) + 1)
+            return (sens * ((dropped_v + 1.0) ** 1.5), dropped_v, base_order.index(v))
 
         eligible = [
             v for v in range(V)
             if vk[v] - dk >= (min_k_rec if topo[v]["is_rec"] else min_k_boundary)
         ]
+        if max_spread is not None and eligible:
+            cur_max = max(vk)
+            spread_eligible = [v for v in eligible if cur_max - (vk[v] - dk) <= max_spread]
+            if spread_eligible:
+                eligible = spread_eligible
         if not eligible:
             eligible = [v for v in range(V) if vk[v] >= dk]
         if not eligible:
@@ -283,6 +325,194 @@ def solve_general_topk_iter_greedy(
                 vk[v_pick] -= dk
 
     return vk
+
+
+def solve_convex_bounded_swap_topk(
+    eval_a_fn,
+    eval_b_fn,
+    topo: list[dict[str, Any]],
+    K_max: int,
+    k_bar: int,
+    *,
+    max_delta: int = 1,
+    max_swaps: int = 16,
+    drop_pool: int = 5,
+    boost_pool: int = 5,
+    patience: int = 3,
+    min_k_global: int = 1,
+    init_slopes: tuple[np.ndarray, np.ndarray] | None = None,
+) -> dict[str, Any]:
+    """Convex-bounded pairwise swap solver starting FROM uniform `vk = [k_bar] * V`.
+
+    Addresses both R4-B failure modes directly:
+      1. Measures exact signed two-sided local marginal slopes AT `k_bar` across all V visits
+         (`drop_cost[v] = NLL(k_bar - 1) - NLL_unif`, `boost_gain[v] = NLL_unif - NLL(k_bar + 1)`)
+         with zero clamping and zero candidate lockout.
+      2. Enforces strict convex box bounds `k_v in [max(min_k_global, k_bar - max_delta),
+         min(K_max, k_bar + max_delta)]` and refreshes slopes dynamically whenever a visit moves,
+         preventing `k=1` Jensen convexity collapse.
+      3. Validates every swap on disjoint `calib_b` and returns the best `calib_b`-verified
+         schedule (automatically falling back to `s=0` uniform if no swap genuinely generalizes!).
+    """
+    V = len(topo)
+    k_lo = max(min_k_global, k_bar - max_delta)
+    k_hi = min(K_max, k_bar + max_delta)
+    vk = [int(k_bar)] * V
+
+    base_a = float(eval_a_fn(vk))
+    base_b = float(eval_b_fn(vk))
+
+    # Step 1: Exact all-V signed local two-sided marginal slopes at uniform k_bar
+    if init_slopes is not None:
+        drop_cost = np.array(init_slopes[0], dtype=np.float64).copy()
+        boost_gain = np.array(init_slopes[1], dtype=np.float64).copy()
+    else:
+        drop_cost = np.zeros(V, dtype=np.float64)
+        boost_gain = np.zeros(V, dtype=np.float64)
+        for v in range(V):
+            if vk[v] > k_lo:
+                vk_d = list(vk)
+                vk_d[v] -= 1
+                drop_cost[v] = float(eval_a_fn(vk_d)) - base_a
+            else:
+                drop_cost[v] = 1e9
+            if vk[v] < k_hi:
+                vk_b = list(vk)
+                vk_b[v] += 1
+                boost_gain[v] = base_a - float(eval_a_fn(vk_b))
+            else:
+                boost_gain[v] = -1e9
+
+    drop_cost_init = drop_cost.copy()
+    boost_gain_init = boost_gain.copy()
+
+    cur_a = base_a
+    best_b = base_b
+    best_a = base_a
+    best_step = 0
+    best_vk = list(vk)
+    no_improve_b = 0
+    trace: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "v_drop": None,
+            "v_boost": None,
+            "calib_a": base_a,
+            "calib_b": base_b,
+            "min_k": min(vk),
+            "max_k": max(vk),
+        }
+    ]
+
+    # Step 2: Iterative non-additive pairwise swaps with disjoint calib_b guard
+    for step in range(1, max_swaps + 1):
+        elig_drops = [v for v in range(V) if vk[v] > k_lo]
+        elig_boosts = [v for v in range(V) if vk[v] < k_hi]
+        if not elig_drops or not elig_boosts:
+            break
+
+        elig_drops.sort(key=lambda v: (float(drop_cost[v]), v))
+        elig_boosts.sort(key=lambda v: (-float(boost_gain[v]), v))
+        cand_d = elig_drops[:drop_pool]
+        cand_b = elig_boosts[:boost_pool]
+
+        # Re-evaluate top drop & boost candidates under the CURRENT non-additive state `vk`
+        d_scored: list[tuple[float, int]] = []
+        for vd in cand_d:
+            vk_try = list(vk)
+            vk_try[vd] -= 1
+            c_val = float(eval_a_fn(vk_try)) - cur_a
+            drop_cost[vd] = c_val
+            d_scored.append((c_val, vd))
+        d_scored.sort(key=lambda t: (t[0], t[1]))
+
+        b_scored: list[tuple[float, int]] = []
+        for vb in cand_b:
+            vk_try = list(vk)
+            vk_try[vb] += 1
+            g_val = cur_a - float(eval_a_fn(vk_try))
+            boost_gain[vb] = g_val
+            b_scored.append((g_val, vb))
+        b_scored.sort(key=lambda t: (-t[0], t[1]))
+
+        # Jointly score top 2 x 2 disjoint (drop, boost) pairs on calib_a
+        top_d = [vd for _, vd in d_scored[:2]]
+        top_b = [vb for _, vb in b_scored[:2]]
+        best_pair: tuple[float, int, int] | None = None
+        for vd in top_d:
+            for vb in top_b:
+                if vd == vb:
+                    continue
+                vk_pair = list(vk)
+                vk_pair[vd] -= 1
+                vk_pair[vb] += 1
+                val_a = float(eval_a_fn(vk_pair))
+                if best_pair is None or val_a < best_pair[0]:
+                    best_pair = (val_a, vd, vb)
+
+        if best_pair is None or best_pair[0] >= cur_a - 1e-5:
+            break
+
+        next_a, v_drop, v_boost = best_pair
+        vk[v_drop] -= 1
+        vk[v_boost] += 1
+        cur_a = next_a
+
+        # Refresh local slopes of the moved visits immediately (critical for max_delta >= 2!)
+        if vk[v_drop] > k_lo:
+            vk_tmp = list(vk)
+            vk_tmp[v_drop] -= 1
+            drop_cost[v_drop] = float(eval_a_fn(vk_tmp)) - cur_a
+        else:
+            drop_cost[v_drop] = 1e9
+        if vk[v_boost] < k_hi:
+            vk_tmp = list(vk)
+            vk_tmp[v_boost] += 1
+            boost_gain[v_boost] = cur_a - float(eval_a_fn(vk_tmp))
+        else:
+            boost_gain[v_boost] = -1e9
+
+        val_b = float(eval_b_fn(vk))
+        trace.append(
+            {
+                "step": int(step),
+                "v_drop": int(v_drop),
+                "v_boost": int(v_boost),
+                "v_drop_stage": topo[v_drop]["stage"],
+                "v_boost_stage": topo[v_boost]["stage"],
+                "calib_a": float(cur_a),
+                "calib_b": float(val_b),
+                "min_k": int(min(vk)),
+                "max_k": int(max(vk)),
+            }
+        )
+
+        if val_b < best_b - 1e-5:
+            best_b = val_b
+            best_a = cur_a
+            best_step = step
+            best_vk = list(vk)
+            no_improve_b = 0
+        else:
+            no_improve_b += 1
+            if no_improve_b >= patience:
+                break
+
+    return {
+        "k_bar": int(k_bar),
+        "max_delta": int(max_delta),
+        "best_vk": best_vk,
+        "final_vk": list(vk),
+        "best_step": int(best_step),
+        "n_steps": len(trace) - 1,
+        "base_a": float(base_a),
+        "base_b": float(base_b),
+        "best_a": float(best_a),
+        "best_b": float(best_b),
+        "drop_cost_init": drop_cost_init.tolist(),
+        "boost_gain_init": boost_gain_init.tolist(),
+        "trace": trace,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -652,15 +882,27 @@ def main() -> None:
         obqa_enc = prepare_mcq_encoded_hf(load_openbookqa_samples(Path(args.dataset_dir), n_samples=int(mcq_limits["openbookqa"]), seed=int(cfg.get("seed", 20261126))), tokenizer)
         print(f"[r4b:inkling2] Loaded splits: diag={len(diag_seqs)}, calib_a={len(calib_a)}, calib_b={len(calib_b)}, eval={len(eval_seqs)} | MCQ: ARC-C={len(arc_c_enc)}, ARC-E={len(arc_e_enc)}, OBQA={len(obqa_enc)}", flush=True)
 
-        speed_schedule_names = [
-            "nvfp4_base",
-            "cut25_iter_loopsched",
-            "cut38_iter_loopsched",
-            "cut50_unif_k4_noren",
-            "cut50_iter_loopsched",
-            "cut62_iter_loopsched",
-            "cut75_iter_loopsched",
-        ]
+        run_mode = str(cfg.get("mode", "r4b"))
+        if run_mode == "r4c_convex_swap":
+            speed_schedule_names = [
+                "nvfp4_base",
+                "cut38_swap_d1_opt",
+                "cut50_unif_k4_opt",
+                "cut50_swap_d1_opt",
+                "cut50_swap_d2_opt",
+                "cut62_swap_d1_opt",
+                "cut75_unif_k2_opt",
+            ]
+        else:
+            speed_schedule_names = [
+                "nvfp4_base",
+                "cut25_iter_loopsched",
+                "cut38_iter_loopsched",
+                "cut50_unif_k4_noren",
+                "cut50_iter_loopsched",
+                "cut62_iter_loopsched",
+                "cut75_iter_loopsched",
+            ]
         n_eval_policies = 18
 
         orx.plan([
@@ -761,153 +1003,279 @@ def main() -> None:
                 p_vg.step(2)
 
             # ------------------------------------------------------------------
-            # Stage 2: Stage Sensitivity + Per-Visit Screening + Non-Additive IterGreedy
+            # Stage 2: Stage Sensitivity + Repaired IterGreedy / Convex-Bounded Swaps
             # ------------------------------------------------------------------
+            def build_gamma_vec(vk: list[int]) -> list[float]:
+                gs = []
+                for v, kv in enumerate(vk):
+                    if 1 <= kv < K_max:
+                        g = float(geom_by_visit[v][kv]["gamma_opt"])
+                        gs.append(float(np.clip(g, 0.85, 1.50)))
+                    else:
+                        gs.append(1.0)
+                return gs
+
             def eval_calib_a(vk: list[int], mode: str = "noren") -> float:
-                controller.set_policy(vk, shrink_mode=mode)
+                vg = build_gamma_vec(vk) if mode == "opt" else None
+                controller.set_policy(vk, shrink_mode=mode, visit_gamma=vg)
                 return float(eval_nll_vllm(llm, calib_a)["nll"])
+
+            def eval_calib_b(vk: list[int], mode: str = "opt") -> float:
+                vg = build_gamma_vec(vk) if mode == "opt" else None
+                controller.set_policy(vk, shrink_mode=mode, visit_gamma=vg)
+                return float(eval_nll_vllm(llm, calib_b)["nll"])
+
+            swap_diagnostics: dict[str, Any] = {}
+            stage_sens_k4: dict[str, float] = {}
+            stage_sens_k2: dict[str, float] = {}
+            stage_sens_k0: dict[str, float] = {}
+            visit_sens_k2 = np.zeros(V, dtype=np.float64)
 
             with run.phase("inkling_calib", total=5, unit="steps") as p_cal:
                 t_cal0 = time.time()
                 base_a = eval_calib_a([K_max] * V, mode="renorm")
 
-                # Step 1: Joint stage-level sensitivity (k=4, k=2, k=0)
-                stage_sens_k4: dict[str, float] = {}
-                stage_sens_k2: dict[str, float] = {}
-                stage_sens_k0: dict[str, float] = {}
-                for st in stages:
-                    for k_test, dst_map in ((4, stage_sens_k4), (2, stage_sens_k2), (0, stage_sens_k0)):
-                        vk_try = [k_test if topo[v]["stage"] == st else K_max for v in range(V)]
-                        dst_map[st] = max(0.0, eval_calib_a(vk_try, mode="noren") - base_a)
-                print(
-                    f"[r4b:inkling2] Stage Sensitivity (ΔNLL on calib_a): "
-                    f"k=4:{ {k: round(v, 4) for k, v in stage_sens_k4.items()} } | "
-                    f"k=2:{ {k: round(v, 4) for k, v in stage_sens_k2.items()} } | "
-                    f"k=0:{ {k: round(v, 3) for k, v in stage_sens_k0.items()} }",
-                    flush=True,
-                )
-                p_cal.step(1)
+                if run_mode == "r4c_convex_swap":
+                    eval_a_opt = lambda vk: eval_calib_a(vk, mode="opt")
+                    eval_b_opt = lambda vk: eval_calib_b(vk, mode="opt")
 
-                # Step 2: Single-visit 8->2 sensitivity across all 48 visits (fast: 48 forwards!)
-                visit_sens_k2 = np.zeros(V, dtype=np.float64)
-                for v in range(V):
-                    vk_try = [K_max] * V
-                    vk_try[v] = 2
-                    visit_sens_k2[v] = max(0.0, eval_calib_a(vk_try, mode="noren") - base_a)
-                stage_priority = sorted(stages, key=lambda st: float(stage_sens_k2[st]))
-                p_cal.step(2)
+                    # Step 1: Stage sensitivity under opt shrinkage + signed single-visit 8->4 scan
+                    for st in stages:
+                        for k_test, dst_map in ((4, stage_sens_k4), (2, stage_sens_k2)):
+                            vk_try = [k_test if topo[v]["stage"] == st else K_max for v in range(V)]
+                            dst_map[st] = float(eval_a_opt(vk_try) - base_a)
+                    visit_sens_k4 = np.zeros(V, dtype=np.float64)
+                    for v in range(V):
+                        vk_try = [K_max] * V
+                        vk_try[v] = 4
+                        visit_sens_k4[v] = float(eval_a_opt(vk_try) - base_a)
+                    visit_sens_k2 = visit_sens_k4  # serialized under visit_sens_k2/k4 for schema parity
+                    stage_priority = sorted(stages, key=lambda st: float(stage_sens_k2[st]))
+                    print(
+                        f"[r4c:inkling2] Stage Sensitivity (opt, signed ΔNLL on calib_a): "
+                        f"k=4:{ {k: round(v, 4) for k, v in stage_sens_k4.items()} } | "
+                        f"k=2:{ {k: round(v, 4) for k, v in stage_sens_k2.items()} }",
+                        flush=True,
+                    )
+                    p_cal.step(1)
 
-                # Step 3: Layer-only & Stage-static baselines + Non-additive IterGreedy (-25% and -37.5%)
-                vk_38_layer = solve_layer_only_topk_schedule(topo, visit_sens_k2, K_max, 0.375, min_k=1)
-                vk_50_layer = solve_layer_only_topk_schedule(topo, visit_sens_k2, K_max, 0.50, min_k=1)
-                vk_50_stage = solve_stage_static_topk(topo, stage_sens_k2, K_max, 0.50, min_k=1)
+                    # Step 2: Repaired top-down IterGreedy (zero-floor + max_spread=2 + opt shrinkage)
+                    vk_50_iter_fixed = solve_general_topk_iter_greedy(
+                        eval_a_opt, topo, K_max, 0.50,
+                        stage_priority_order=stage_priority,
+                        visit_sens=visit_sens_k4,
+                        min_k_boundary=3, min_k_rec=2,
+                        step_delta_k=1, cand_pool_size=10,
+                        batch_drop_per_round=4, max_spread=2,
+                    )
+                    print(
+                        f"[r4c:inkling2] Repaired cut50_iter_fixed_opt (sum={sum(vk_50_iter_fixed)}/384, "
+                        f"range=[{min(vk_50_iter_fixed)},{max(vk_50_iter_fixed)}]): "
+                        f"{_fmt_stage_k_summary(topo, vk_50_iter_fixed)}",
+                        flush=True,
+                    )
+                    p_cal.step(2)
 
-                # Chain non-additive IterGreedy smoothly: 0% -> -25% -> -37.5% -> -50% -> -62.5% -> -75%
-                # Drop 4 visits by delta_k=1 per round from pool of 10 -> fast (~30 rounds total across ALL 5 cuts!)
-                vk_25_iter = solve_general_topk_iter_greedy(
-                    eval_calib_a, topo, K_max, 0.25,
-                    stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
-                    min_k_boundary=4, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
-                    batch_drop_per_round=4,
-                )
-                vk_38_iter = solve_general_topk_iter_greedy(
-                    eval_calib_a, topo, K_max, 0.375,
-                    stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
-                    min_k_boundary=4, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
-                    start_vk=vk_25_iter, batch_drop_per_round=4,
-                )
-                p_cal.step(3)
+                    # Step 3: Convex-bounded +-1 swaps at -25% (k=6) and -37.5% (k=5)
+                    sw_25 = solve_convex_bounded_swap_topk(
+                        eval_a_opt, eval_b_opt, topo, K_max, k_bar=6,
+                        max_delta=1, max_swaps=16, drop_pool=5, boost_pool=5, patience=3,
+                    )
+                    sw_38 = solve_convex_bounded_swap_topk(
+                        eval_a_opt, eval_b_opt, topo, K_max, k_bar=5,
+                        max_delta=1, max_swaps=16, drop_pool=5, boost_pool=5, patience=3,
+                    )
+                    swap_diagnostics["cut25_swap_d1_opt"] = sw_25
+                    swap_diagnostics["cut38_swap_d1_opt"] = sw_38
+                    for s_lbl, sw in [("cut25_swap_d1_opt", sw_25), ("cut38_swap_d1_opt", sw_38)]:
+                        print(
+                            f"[r4c:inkling2] {s_lbl}: best_step={sw['best_step']}/{sw['n_steps']} | "
+                            f"calib_a {sw['base_a']:.4f}->{sw['best_a']:.4f} ({sw['base_a']-sw['best_a']:+.4f}) | "
+                            f"calib_b {sw['base_b']:.4f}->{sw['best_b']:.4f} ({sw['base_b']-sw['best_b']:+.4f}) | "
+                            f"{_fmt_stage_k_summary(topo, sw['best_vk'])}",
+                            flush=True,
+                        )
+                    p_cal.step(3)
 
-                # Step 4: -50% IterGreedy (high precision: batch_drop=2 from pool=10!)
-                vk_50_iter = solve_general_topk_iter_greedy(
-                    eval_calib_a, topo, K_max, 0.50,
-                    stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
-                    min_k_boundary=3, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
-                    start_vk=vk_38_iter, batch_drop_per_round=2,
-                )
-                p_cal.step(4)
+                    # Step 4: Convex-bounded swaps at -50% (k=4): BOTH +-1 (d1) AND +-2 (d2, reusing init slopes!)
+                    sw_50_d1 = solve_convex_bounded_swap_topk(
+                        eval_a_opt, eval_b_opt, topo, K_max, k_bar=4,
+                        max_delta=1, max_swaps=20, drop_pool=5, boost_pool=5, patience=3,
+                    )
+                    sw_50_d2 = solve_convex_bounded_swap_topk(
+                        eval_a_opt, eval_b_opt, topo, K_max, k_bar=4,
+                        max_delta=2, max_swaps=20, drop_pool=5, boost_pool=5, patience=3,
+                        init_slopes=(np.array(sw_50_d1["drop_cost_init"]), np.array(sw_50_d1["boost_gain_init"])),
+                    )
+                    swap_diagnostics["cut50_swap_d1_opt"] = sw_50_d1
+                    swap_diagnostics["cut50_swap_d2_opt"] = sw_50_d2
+                    for s_lbl, sw in [("cut50_swap_d1_opt", sw_50_d1), ("cut50_swap_d2_opt", sw_50_d2)]:
+                        print(
+                            f"[r4c:inkling2] {s_lbl}: best_step={sw['best_step']}/{sw['n_steps']} | "
+                            f"calib_a {sw['base_a']:.4f}->{sw['best_a']:.4f} ({sw['base_a']-sw['best_a']:+.4f}) | "
+                            f"calib_b {sw['base_b']:.4f}->{sw['best_b']:.4f} ({sw['base_b']-sw['best_b']:+.4f}) | "
+                            f"{_fmt_stage_k_summary(topo, sw['best_vk'])}",
+                            flush=True,
+                        )
+                    p_cal.step(4)
 
-                # Step 5: -62.5% and -75% IterGreedy (min_k_boundary=2, min_k_rec=1 -> zero k=0 cliffs!)
-                vk_62_iter = solve_general_topk_iter_greedy(
-                    eval_calib_a, topo, K_max, 0.625,
-                    stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
-                    min_k_boundary=2, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
-                    start_vk=vk_50_iter, batch_drop_per_round=4,
-                )
-                vk_75_iter = solve_general_topk_iter_greedy(
-                    eval_calib_a, topo, K_max, 0.75,
-                    stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
-                    min_k_boundary=1, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
-                    start_vk=vk_62_iter, batch_drop_per_round=4,
-                )
+                    # Step 5: Convex-bounded +-1 swaps at -62.5% (k=3)
+                    sw_62_d1 = solve_convex_bounded_swap_topk(
+                        eval_a_opt, eval_b_opt, topo, K_max, k_bar=3,
+                        max_delta=1, max_swaps=16, drop_pool=5, boost_pool=5, patience=3,
+                    )
+                    swap_diagnostics["cut62_swap_d1_opt"] = sw_62_d1
+                    print(
+                        f"[r4c:inkling2] cut62_swap_d1_opt: best_step={sw_62_d1['best_step']}/{sw_62_d1['n_steps']} | "
+                        f"calib_a {sw_62_d1['base_a']:.4f}->{sw_62_d1['best_a']:.4f} ({sw_62_d1['base_a']-sw_62_d1['best_a']:+.4f}) | "
+                        f"calib_b {sw_62_d1['base_b']:.4f}->{sw_62_d1['best_b']:.4f} ({sw_62_d1['base_b']-sw_62_d1['best_b']:+.4f}) | "
+                        f"{_fmt_stage_k_summary(topo, sw_62_d1['best_vk'])}",
+                        flush=True,
+                    )
+                    print(f"[r4c:inkling2] Calibration complete in {time.time()-t_cal0:.1f}s.", flush=True)
+                    p_cal.step(5)
 
-                # Build exact calibrated per-visit gamma_v* vectors for opt policies
-                def build_gamma_vec(vk: list[int]) -> list[float]:
-                    gs = []
-                    for v, kv in enumerate(vk):
-                        if 1 <= kv < K_max:
-                            g = float(geom_by_visit[v][kv]["gamma_opt"])
-                            gs.append(float(np.clip(g, 0.85, 1.50)))
-                        else:
-                            gs.append(1.0)
-                    return gs
+                    policies: list[tuple[str, list[int], str, list[float] | None]] = [
+                        ("nvfp4_base",            [8] * V,               "renorm", None),
+                        ("cut25_unif_k6_noren",   [6] * V,               "noren",  None),
+                        ("cut25_unif_k6_opt",     [6] * V,               "opt",    build_gamma_vec([6] * V)),
+                        ("cut25_swap_d1_opt",     sw_25["best_vk"],      "opt",    build_gamma_vec(sw_25["best_vk"])),
+                        ("cut38_unif_k5_noren",   [5] * V,               "noren",  None),
+                        ("cut38_unif_k5_opt",     [5] * V,               "opt",    build_gamma_vec([5] * V)),
+                        ("cut38_swap_d1_opt",     sw_38["best_vk"],      "opt",    build_gamma_vec(sw_38["best_vk"])),
+                        ("cut50_unif_k4_renorm",  [4] * V,               "renorm", None),
+                        ("cut50_unif_k4_noren",   [4] * V,               "noren",  None),
+                        ("cut50_unif_k4_opt",     [4] * V,               "opt",    build_gamma_vec([4] * V)),
+                        ("cut50_iter_fixed_opt",  vk_50_iter_fixed,      "opt",    build_gamma_vec(vk_50_iter_fixed)),
+                        ("cut50_swap_d1_opt",     sw_50_d1["best_vk"],   "opt",    build_gamma_vec(sw_50_d1["best_vk"])),
+                        ("cut50_swap_d2_opt",     sw_50_d2["best_vk"],   "opt",    build_gamma_vec(sw_50_d2["best_vk"])),
+                        ("cut62_unif_k3_noren",   [3] * V,               "noren",  None),
+                        ("cut62_unif_k3_opt",     [3] * V,               "opt",    build_gamma_vec([3] * V)),
+                        ("cut62_swap_d1_opt",     sw_62_d1["best_vk"],   "opt",    build_gamma_vec(sw_62_d1["best_vk"])),
+                        ("cut75_unif_k2_noren",   [2] * V,               "noren",  None),
+                        ("cut75_unif_k2_opt",     [2] * V,               "opt",    build_gamma_vec([2] * V)),
+                    ]
+                else:
+                    # Legacy R4-B path
+                    for st in stages:
+                        for k_test, dst_map in ((4, stage_sens_k4), (2, stage_sens_k2), (0, stage_sens_k0)):
+                            vk_try = [k_test if topo[v]["stage"] == st else K_max for v in range(V)]
+                            dst_map[st] = max(0.0, eval_calib_a(vk_try, mode="noren") - base_a)
+                    print(
+                        f"[r4b:inkling2] Stage Sensitivity (ΔNLL on calib_a): "
+                        f"k=4:{ {k: round(v, 4) for k, v in stage_sens_k4.items()} } | "
+                        f"k=2:{ {k: round(v, 4) for k, v in stage_sens_k2.items()} } | "
+                        f"k=0:{ {k: round(v, 3) for k, v in stage_sens_k0.items()} }",
+                        flush=True,
+                    )
+                    p_cal.step(1)
 
-                gammas_k4 = build_gamma_vec([4] * V)
-                gammas_50_iter = build_gamma_vec(vk_50_iter)
+                    for v in range(V):
+                        vk_try = [K_max] * V
+                        vk_try[v] = 2
+                        visit_sens_k2[v] = max(0.0, eval_calib_a(vk_try, mode="noren") - base_a)
+                    stage_priority = sorted(stages, key=lambda st: float(stage_sens_k2[st]))
+                    p_cal.step(2)
 
-                print(f"[r4b:inkling2] Calibration complete in {time.time()-t_cal0:.1f}s:", flush=True)
-                for nm, vk in [
-                    ("cut25_iter", vk_25_iter),
-                    ("cut38_layer", vk_38_layer),
-                    ("cut38_iter", vk_38_iter),
-                    ("cut50_layer", vk_50_layer),
-                    ("cut50_stage", vk_50_stage),
-                    ("cut50_iter", vk_50_iter),
-                    ("cut62_iter", vk_62_iter),
-                    ("cut75_iter", vk_75_iter),
-                ]:
-                    print(f"  {nm:12s} (sum={sum(vk):3d}/384, cut={(1-sum(vk)/384)*100:4.1f}%): {_fmt_stage_k_summary(topo, vk)}", flush=True)
-                p_cal.step(5)
+                    vk_38_layer = solve_layer_only_topk_schedule(topo, visit_sens_k2, K_max, 0.375, min_k=1)
+                    vk_50_layer = solve_layer_only_topk_schedule(topo, visit_sens_k2, K_max, 0.50, min_k=1)
+                    vk_50_stage = solve_stage_static_topk(topo, stage_sens_k2, K_max, 0.50, min_k=1)
 
-            # ------------------------------------------------------------------
-            # Stage 3: Full Held-Out Quality Evaluation (18 Policies x 64 NLL + 2,272 MCQ)
-            # ------------------------------------------------------------------
-            policies: list[tuple[str, list[int], str, list[float] | None]] = [
-                ("nvfp4_base",            [8] * V,       "renorm", None),
-                ("cut25_unif_k6_renorm",  [6] * V,       "renorm", None),
-                ("cut25_unif_k6_noren",   [6] * V,       "noren",  None),
-                ("cut25_iter_loopsched",  vk_25_iter,    "noren",  None),
-                ("cut38_layer_only",      vk_38_layer,   "noren",  None),
-                ("cut38_iter_loopsched",  vk_38_iter,    "noren",  None),
-                ("cut50_unif_k4_renorm",  [4] * V,       "renorm", None),
-                ("cut50_unif_k4_noren",   [4] * V,       "noren",  None),
-                ("cut50_unif_k4_opt",     [4] * V,       "opt",    gammas_k4),
-                ("cut50_layer_only",      vk_50_layer,   "noren",  None),
-                ("cut50_stage_static",    vk_50_stage,   "noren",  None),
-                ("cut50_iter_loopsched",  vk_50_iter,    "noren",  None),
-                ("cut50_iter_opt",        vk_50_iter,    "opt",    gammas_50_iter),
-                ("cut62_unif_k3_noren",   [3] * V,       "noren",  None),
-                ("cut62_iter_loopsched",  vk_62_iter,    "noren",  None),
-                ("cut75_unif_k2_renorm",  [2] * V,       "renorm", None),
-                ("cut75_unif_k2_noren",   [2] * V,       "noren",  None),
-                ("cut75_iter_loopsched",  vk_75_iter,    "noren",  None),
-            ]
+                    vk_25_iter = solve_general_topk_iter_greedy(
+                        eval_calib_a, topo, K_max, 0.25,
+                        stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
+                        min_k_boundary=4, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
+                        batch_drop_per_round=4,
+                    )
+                    vk_38_iter = solve_general_topk_iter_greedy(
+                        eval_calib_a, topo, K_max, 0.375,
+                        stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
+                        min_k_boundary=4, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
+                        start_vk=vk_25_iter, batch_drop_per_round=4,
+                    )
+                    p_cal.step(3)
+
+                    vk_50_iter = solve_general_topk_iter_greedy(
+                        eval_calib_a, topo, K_max, 0.50,
+                        stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
+                        min_k_boundary=3, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
+                        start_vk=vk_38_iter, batch_drop_per_round=2,
+                    )
+                    p_cal.step(4)
+
+                    vk_62_iter = solve_general_topk_iter_greedy(
+                        eval_calib_a, topo, K_max, 0.625,
+                        stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
+                        min_k_boundary=2, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
+                        start_vk=vk_50_iter, batch_drop_per_round=4,
+                    )
+                    vk_75_iter = solve_general_topk_iter_greedy(
+                        eval_calib_a, topo, K_max, 0.75,
+                        stage_priority_order=stage_priority, visit_sens=visit_sens_k2,
+                        min_k_boundary=1, min_k_rec=1, step_delta_k=1, cand_pool_size=10,
+                        start_vk=vk_62_iter, batch_drop_per_round=4,
+                    )
+
+                    gammas_k4 = build_gamma_vec([4] * V)
+                    gammas_50_iter = build_gamma_vec(vk_50_iter)
+
+                    print(f"[r4b:inkling2] Calibration complete in {time.time()-t_cal0:.1f}s:", flush=True)
+                    for nm, vk in [
+                        ("cut25_iter", vk_25_iter),
+                        ("cut38_layer", vk_38_layer),
+                        ("cut38_iter", vk_38_iter),
+                        ("cut50_layer", vk_50_layer),
+                        ("cut50_stage", vk_50_stage),
+                        ("cut50_iter", vk_50_iter),
+                        ("cut62_iter", vk_62_iter),
+                        ("cut75_iter", vk_75_iter),
+                    ]:
+                        print(f"  {nm:12s} (sum={sum(vk):3d}/384, cut={(1-sum(vk)/384)*100:4.1f}%): {_fmt_stage_k_summary(topo, vk)}", flush=True)
+                    p_cal.step(5)
+
+                    policies = [
+                        ("nvfp4_base",            [8] * V,       "renorm", None),
+                        ("cut25_unif_k6_renorm",  [6] * V,       "renorm", None),
+                        ("cut25_unif_k6_noren",   [6] * V,       "noren",  None),
+                        ("cut25_iter_loopsched",  vk_25_iter,    "noren",  None),
+                        ("cut38_layer_only",      vk_38_layer,   "noren",  None),
+                        ("cut38_iter_loopsched",  vk_38_iter,    "noren",  None),
+                        ("cut50_unif_k4_renorm",  [4] * V,       "renorm", None),
+                        ("cut50_unif_k4_noren",   [4] * V,       "noren",  None),
+                        ("cut50_unif_k4_opt",     [4] * V,       "opt",    gammas_k4),
+                        ("cut50_layer_only",      vk_50_layer,   "noren",  None),
+                        ("cut50_stage_static",    vk_50_stage,   "noren",  None),
+                        ("cut50_iter_loopsched",  vk_50_iter,    "noren",  None),
+                        ("cut50_iter_opt",        vk_50_iter,    "opt",    gammas_50_iter),
+                        ("cut62_unif_k3_noren",   [3] * V,       "noren",  None),
+                        ("cut62_iter_loopsched",  vk_62_iter,    "noren",  None),
+                        ("cut75_unif_k2_renorm",  [2] * V,       "renorm", None),
+                        ("cut75_unif_k2_noren",   [2] * V,       "noren",  None),
+                        ("cut75_iter_loopsched",  vk_75_iter,    "noren",  None),
+                    ]
             policy_map = {p[0]: p for p in policies}
 
             eval_results: dict[str, dict[str, Any]] = {}
             per_seq_nlls: dict[str, list[float]] = {}
             pooled_mcq_flags: dict[str, list[int]] = {}
+            eval_cache: dict[tuple, tuple[dict[str, Any], float, list[int], float, list[int], float, list[int]]] = {}
             base_nll = 0.0
             base_per_seq: list[float] = []
 
             with run.phase("inkling_eval", total=len(policies), unit="conds") as p_ev:
                 for idx, (pname, vk, smode, vgamma) in enumerate(policies, 1):
                     t0 = time.time()
-                    controller.set_policy(vk, shrink_mode=smode, visit_gamma=vgamma)
-                    nll_res = eval_nll_vllm(llm, eval_seqs)
-                    arc_c, fc = eval_mcq_vllm(llm, arc_c_enc)
-                    arc_e, fe = eval_mcq_vllm(llm, arc_e_enc)
-                    obqa, fo = eval_mcq_vllm(llm, obqa_enc)
+                    sig = (tuple(vk), smode, tuple(round(g, 6) for g in (vgamma or [])))
+                    reused = sig in eval_cache
+                    if reused:
+                        nll_res, arc_c, fc, arc_e, fe, obqa, fo = eval_cache[sig]
+                    else:
+                        controller.set_policy(vk, shrink_mode=smode, visit_gamma=vgamma)
+                        nll_res = eval_nll_vllm(llm, eval_seqs)
+                        arc_c, fc = eval_mcq_vllm(llm, arc_c_enc)
+                        arc_e, fe = eval_mcq_vllm(llm, arc_e_enc)
+                        obqa, fo = eval_mcq_vllm(llm, obqa_enc)
+                        eval_cache[sig] = (nll_res, arc_c, fc, arc_e, fe, obqa, fo)
                     avg_mcq = float(np.mean([arc_c, arc_e, obqa]))
                     cut_pct = 100.0 * (1.0 - sum(vk) / float(V * K_max))
 
@@ -940,13 +1308,15 @@ def main() -> None:
                         "obqa": float(obqa),
                         "avg_mcq": float(avg_mcq),
                         "elapsed_s": float(el),
+                        "reused_exact_cache": bool(reused),
                     }
                     eval_results[pname] = rec
+                    tag_r = " (exact-cache)" if reused else ""
                     print(
-                        f"[r4b:inkling2] {pname:22s} cut={cut_pct:5.1f}% (k={np.mean(vk):.2f}) | "
+                        f"[{run_mode}] {pname:22s} cut={cut_pct:5.1f}% (k={np.mean(vk):.2f}) | "
                         f"NLL={nll_res['nll']:.4f} (Δ={dnll:+.4f}) | "
                         f"ARC-C={arc_c*100:5.1f}% ARC-E={arc_e*100:5.1f}% OBQA={obqa*100:5.1f}% Avg={avg_mcq*100:5.1f}% | "
-                        f"[{rec['stage_k']}] | t={el:.1f}s",
+                        f"[{rec['stage_k']}] | t={el:.1f}s{tag_r}",
                         flush=True,
                     )
                     p_ev.row(
@@ -970,24 +1340,30 @@ def main() -> None:
             prompt_token_bank = [list(it["tokens"]) for it in eval_seqs[:32]]
             all_speed_rows: list[dict[str, Any]] = []
             base_ms_by_shape: dict[str, float] = {}
+            speed_cache: dict[tuple, list[dict[str, Any]]] = {}
 
             with run.phase("inkling_speed", total=len(speed_schedule_names), unit="scheds") as p_sp:
                 for s_idx, sname in enumerate(speed_schedule_names, 1):
                     _, vk, smode, vgamma = policy_map[sname]
-                    s_rows = benchmark_vllm_cudagraph_schedule(
-                        str(model_path),
-                        controller,
-                        sname,
-                        vk,
-                        smode,
-                        vgamma,
-                        max_model_len=max_model_len,
-                        gpu_memory_utilization=gpu_mem_util,
-                        decode_tokens=int(cfg.get("speed_decode_tokens", 32)),
-                        warmup=int(cfg.get("speed_warmup", 3)),
-                        iters=int(cfg.get("speed_iters", 12)),
-                        prompt_token_bank=prompt_token_bank,
-                    )
+                    sp_sig = (tuple(vk), smode)
+                    if sp_sig in speed_cache:
+                        s_rows = [dict(r, schedule=sname) for r in speed_cache[sp_sig]]
+                    else:
+                        s_rows = benchmark_vllm_cudagraph_schedule(
+                            str(model_path),
+                            controller,
+                            sname,
+                            vk,
+                            smode,
+                            vgamma,
+                            max_model_len=max_model_len,
+                            gpu_memory_utilization=gpu_mem_util,
+                            decode_tokens=int(cfg.get("speed_decode_tokens", 32)),
+                            warmup=int(cfg.get("speed_warmup", 3)),
+                            iters=int(cfg.get("speed_iters", 12)),
+                            prompt_token_bank=prompt_token_bank,
+                        )
+                        speed_cache[sp_sig] = [dict(r) for r in s_rows]
                     b1_spd = 1.0
                     for r in s_rows:
                         if sname == "nvfp4_base":
@@ -1013,7 +1389,7 @@ def main() -> None:
                     p_sp.step(s_idx, latest_b1_speedup=b1_spd)
 
         # ------------------------------------------------------------------
-        # Stage 5: Paired Bootstrap Contrasts & Report
+        # Stage 5: Paired Bootstrap + Exact Paired McNemar Contrasts & Report
         # ------------------------------------------------------------------
         def contrast(first: str, second: str) -> dict[str, Any]:
             # Positive NLL gain = first has LOWER NLL than second!
@@ -1022,35 +1398,69 @@ def main() -> None:
             n_wins = sum(1 for d in nll_diffs if d > 0)
             mcq_diffs = [(a - b) * 100.0 for a, b in zip(pooled_mcq_flags[first], pooled_mcq_flags[second])]
             m_m, m_lo, m_hi = paired_bootstrap_ci(mcq_diffs)
+            mcn = paired_mcnemar_test(pooled_mcq_flags[first], pooled_mcq_flags[second])
             return {
                 "nll_gain": float(n_m),
                 "nll_ci": [float(n_lo), float(n_hi)],
                 "nll_wins": int(n_wins),
                 "mcq_gain_pp": float(m_m),
                 "mcq_ci_pp": [float(m_lo), float(m_hi)],
+                "mcnemar_n10": int(mcn["n10"]),
+                "mcnemar_n01": int(mcn["n01"]),
+                "mcnemar_p": float(mcn["p_value"]),
             }
 
-        contrast_pairs = [
-            ("cut25_unif_k6_noren", "cut25_unif_k6_renorm"),
-            ("cut50_unif_k4_noren", "cut50_unif_k4_renorm"),
-            ("cut50_unif_k4_opt", "cut50_unif_k4_noren"),
-            ("cut75_unif_k2_noren", "cut75_unif_k2_renorm"),
-            ("cut38_iter_loopsched", "cut38_layer_only"),
-            ("cut50_iter_loopsched", "cut50_unif_k4_noren"),
-            ("cut50_iter_loopsched", "cut50_layer_only"),
-            ("cut50_iter_loopsched", "cut50_stage_static"),
-            ("cut50_iter_loopsched", "cut50_unif_k4_renorm"),
-            ("cut50_iter_opt", "cut50_iter_loopsched"),
-            ("cut62_iter_loopsched", "cut62_unif_k3_noren"),
-            ("cut75_iter_loopsched", "cut75_unif_k2_noren"),
-            ("cut75_iter_loopsched", "cut75_unif_k2_renorm"),
-        ]
+        if run_mode == "r4c_convex_swap":
+            contrast_pairs = [
+                # Opt gamma* vs NoRen across ALL 5 cuts
+                ("cut25_unif_k6_opt", "cut25_unif_k6_noren"),
+                ("cut38_unif_k5_opt", "cut38_unif_k5_noren"),
+                ("cut50_unif_k4_noren", "cut50_unif_k4_renorm"),
+                ("cut50_unif_k4_opt", "cut50_unif_k4_noren"),
+                ("cut50_unif_k4_opt", "cut50_unif_k4_renorm"),
+                ("cut62_unif_k3_opt", "cut62_unif_k3_noren"),
+                ("cut75_unif_k2_opt", "cut75_unif_k2_noren"),
+                # Convex-bounded Swap & Repaired IterGreedy vs Uniform Opt/NoRen/Renorm
+                ("cut25_swap_d1_opt", "cut25_unif_k6_opt"),
+                ("cut38_swap_d1_opt", "cut38_unif_k5_opt"),
+                ("cut50_iter_fixed_opt", "cut50_unif_k4_opt"),
+                ("cut50_swap_d1_opt", "cut50_unif_k4_opt"),
+                ("cut50_swap_d1_opt", "cut50_unif_k4_noren"),
+                ("cut50_swap_d1_opt", "cut50_unif_k4_renorm"),
+                ("cut50_swap_d2_opt", "cut50_unif_k4_opt"),
+                ("cut50_swap_d2_opt", "cut50_swap_d1_opt"),
+                ("cut62_swap_d1_opt", "cut62_unif_k3_opt"),
+                # Lossless-threshold Paired McNemar tests vs native nvfp4_base
+                ("cut25_unif_k6_opt", "nvfp4_base"),
+                ("cut25_swap_d1_opt", "nvfp4_base"),
+                ("cut38_unif_k5_opt", "nvfp4_base"),
+                ("cut38_swap_d1_opt", "nvfp4_base"),
+                ("cut50_unif_k4_opt", "nvfp4_base"),
+                ("cut50_swap_d1_opt", "nvfp4_base"),
+            ]
+        else:
+            contrast_pairs = [
+                ("cut25_unif_k6_noren", "cut25_unif_k6_renorm"),
+                ("cut50_unif_k4_noren", "cut50_unif_k4_renorm"),
+                ("cut50_unif_k4_opt", "cut50_unif_k4_noren"),
+                ("cut75_unif_k2_noren", "cut75_unif_k2_renorm"),
+                ("cut38_iter_loopsched", "cut38_layer_only"),
+                ("cut50_iter_loopsched", "cut50_unif_k4_noren"),
+                ("cut50_iter_loopsched", "cut50_layer_only"),
+                ("cut50_iter_loopsched", "cut50_stage_static"),
+                ("cut50_iter_loopsched", "cut50_unif_k4_renorm"),
+                ("cut50_iter_opt", "cut50_iter_loopsched"),
+                ("cut62_iter_loopsched", "cut62_unif_k3_noren"),
+                ("cut75_iter_loopsched", "cut75_unif_k2_noren"),
+                ("cut75_iter_loopsched", "cut75_unif_k2_renorm"),
+            ]
         contrasts = {f"{a}_vs_{b}": contrast(a, b) for a, b in contrast_pairs}
 
         spd_idx = {(r["shape"], r["schedule"]): r for r in all_speed_rows}
         elapsed = time.time() - t_start
 
         payload = {
+            "mode": run_mode,
             "model": "thinkingmachines/Inkling-2-Mini",
             "gpu_index": gpu_idx,
             "gpu_name": gpu_status.name,
@@ -1066,15 +1476,22 @@ def main() -> None:
                 "k0": stage_sens_k0,
             },
             "visit_sens_k2": visit_sens_k2.tolist(),
+            "swap_diagnostics": swap_diagnostics,
             "results": eval_results,
             "speed_rows": all_speed_rows,
             "contrasts": contrasts,
         }
-        (out_dir / "results_r4b_inkling2.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        out_prefix = "r4c_inkling2" if run_mode == "r4c_convex_swap" else "r4b_inkling2"
+        (out_dir / f"results_{out_prefix}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
         # Markdown summary report
+        title_str = (
+            "# Round 4-C: Inkling-2-Mini Convex-Bounded Swap & Opt Shrinkage in Production vLLM"
+            if run_mode == "r4c_convex_swap"
+            else "# Round 4-B: Inkling-2-Mini (Top-8 / 128 Experts, 0 Shared) LoopSched-MoE in Production vLLM"
+        )
         lines = [
-            "# Round 4-B: Inkling-2-Mini (Top-8 / 128 Experts, 0 Shared) LoopSched-MoE in Production vLLM",
+            title_str,
             "",
             f"- GPU: `{gpu_idx}` ({gpu_status.name}), vLLM `{rt['vllm_version']}`, elapsed `{elapsed:.1f}s`",
             f"- Hook Exactness Verify (`k=8` native vs `route_general`): `abs_diff = {nll_diff:.3e}`",
@@ -1123,30 +1540,42 @@ def main() -> None:
                 f"{r['median_ms']:.2f} | {r['iqr_ms']:.2f} | **{r['speedup']:.3f}x** | {r['tok_per_sec']:,.0f} |"
             )
 
-        lines += ["", "## 4. Paired Bootstrap Contrasts (positive = first beats second)"]
+        lines += ["", "## 4. Paired Bootstrap & Exact McNemar Contrasts (positive = first beats second)"]
         for cname, c in contrasts.items():
             lines.append(
                 f"- `{cname}`: NLL `{c['nll_gain']:+.4f}` CI `[{c['nll_ci'][0]:+.4f}, {c['nll_ci'][1]:+.4f}]` "
                 f"({c['nll_wins']}/{len(eval_seqs)} wins) | "
-                f"Pooled MCQ `{c['mcq_gain_pp']:+.2f} pp` CI `[{c['mcq_ci_pp'][0]:+.2f}, {c['mcq_ci_pp'][1]:+.2f}]`"
+                f"Pooled MCQ `{c['mcq_gain_pp']:+.2f} pp` CI `[{c['mcq_ci_pp'][0]:+.2f}, {c['mcq_ci_pp'][1]:+.2f}]` "
+                f"(McNemar flips `{c['mcnemar_n10']}/{c['mcnemar_n01']}`, `p={c['mcnemar_p']:.3g}`)"
             )
 
         report_md = "\n".join(lines) + "\n"
-        (out_dir / "report_r4b_inkling2.md").write_text(report_md, encoding="utf-8")
+        (out_dir / f"report_{out_prefix}.md").write_text(report_md, encoding="utf-8")
 
         with run.phase("report", total=1, unit="file") as p_rep:
-            print("\n========== REPORT (report_r4b_inkling2.md) ==========", flush=True)
+            print(f"\n========== REPORT (report_{out_prefix}.md) ==========", flush=True)
             print(report_md, flush=True)
             print("========== END REPORT ==========", flush=True)
-            p_rep.step(
-                1,
-                inkling_cg_b1_cut50_speedup=float(spd_idx[("decode_B1_L1", "cut50_iter_loopsched")]["speedup"]),
-                inkling_cg_b32_cut50_speedup=float(spd_idx[("decode_B32_L1", "cut50_iter_loopsched")]["speedup"]),
-                inkling_cg_b32_cut75_speedup=float(spd_idx[("decode_B32_L1", "cut75_iter_loopsched")]["speedup"]),
-                inkling_cut50_noren_vs_renorm_nll=float(contrasts["cut50_unif_k4_noren_vs_cut50_unif_k4_renorm"]["nll_gain"]),
-                inkling_cut50_iter_vs_unif_nll=float(contrasts["cut50_iter_loopsched_vs_cut50_unif_k4_noren"]["nll_gain"]),
-                inkling_cut50_iter_vs_renorm_mcq=float(contrasts["cut50_iter_loopsched_vs_cut50_unif_k4_renorm"]["mcq_gain_pp"]),
-            )
+            if run_mode == "r4c_convex_swap":
+                p_rep.step(
+                    1,
+                    inkling_cg_b1_cut50_speedup=float(spd_idx[("decode_B1_L1", "cut50_swap_d1_opt")]["speedup"]),
+                    inkling_cg_b32_cut50_speedup=float(spd_idx[("decode_B32_L1", "cut50_swap_d1_opt")]["speedup"]),
+                    inkling_cg_b32_cut75_speedup=float(spd_idx[("decode_B32_L1", "cut75_unif_k2_opt")]["speedup"]),
+                    inkling_cut50_noren_vs_renorm_nll=float(contrasts["cut50_unif_k4_noren_vs_cut50_unif_k4_renorm"]["nll_gain"]),
+                    inkling_cut50_iter_vs_unif_nll=float(contrasts["cut50_swap_d1_opt_vs_cut50_unif_k4_noren"]["nll_gain"]),
+                    inkling_cut50_iter_vs_renorm_mcq=float(contrasts["cut50_swap_d1_opt_vs_cut50_unif_k4_renorm"]["mcq_gain_pp"]),
+                )
+            else:
+                p_rep.step(
+                    1,
+                    inkling_cg_b1_cut50_speedup=float(spd_idx[("decode_B1_L1", "cut50_iter_loopsched")]["speedup"]),
+                    inkling_cg_b32_cut50_speedup=float(spd_idx[("decode_B32_L1", "cut50_iter_loopsched")]["speedup"]),
+                    inkling_cg_b32_cut75_speedup=float(spd_idx[("decode_B32_L1", "cut75_iter_loopsched")]["speedup"]),
+                    inkling_cut50_noren_vs_renorm_nll=float(contrasts["cut50_unif_k4_noren_vs_cut50_unif_k4_renorm"]["nll_gain"]),
+                    inkling_cut50_iter_vs_unif_nll=float(contrasts["cut50_iter_loopsched_vs_cut50_unif_k4_noren"]["nll_gain"]),
+                    inkling_cut50_iter_vs_renorm_mcq=float(contrasts["cut50_iter_loopsched_vs_cut50_unif_k4_renorm"]["mcq_gain_pp"]),
+                )
     finally:
         gpu_lock.release()
 

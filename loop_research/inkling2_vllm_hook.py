@@ -468,6 +468,19 @@ def _compute_desc_top8_weights_pytorch(
     return ids_desc, w_desc
 
 
+def _bucket_eager_max_ctas(max_ctas: int) -> int:
+    """Bucket `plan.max_ctas` during eager mode to eliminate variable-T Triton JIT recompiles.
+
+    `_place_experts` treats `MAX_CTAS` as an upper bound on `num_tiles` and strides `tiles` by
+    `2 * MAX_CTAS`, so rounding `plan.max_ctas` upward while passing the same `ExpertPlan` to both
+    `route_general` and `experts` is 100% bit-exact and cuts cold Triton compiles by >10x.
+    """
+    m = max(2, int(max_ctas))
+    if m <= 64:
+        return 1 << (m - 1).bit_length()
+    return ((m + 63) // 64) * 64
+
+
 def install_inkling2_loopsched_hook(
     vllm_model: Any,
     controller: Inkling2LoopSchedController,
@@ -706,7 +719,11 @@ class Inkling2VLLMClassPatch:
                 experts.nvfp4,
                 experts.shapes,
             )
-            if plan.max_ctas < 2:
+            if plan.kernels == (0, 0) and not torch.cuda.is_current_stream_capturing():
+                b_ctas = _bucket_eager_max_ctas(plan.max_ctas)
+                if b_ctas != plan.max_ctas:
+                    plan = ExpertPlan(plan.tile, b_ctas, plan.kernels)
+            elif plan.max_ctas < 2:
                 # Guarantee Triton associative_scan operates on length >= 2 even for T=1, k_v=1
                 plan = ExpertPlan(plan.tile, 2, plan.kernels)
             shrink_noren = ctrl.shrink_mode in ("noren", "opt")

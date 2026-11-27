@@ -1,5 +1,6 @@
 {
   "idea": "r4b_inkling2_loopsched",
+  "mode": "r4c_convex_swap",
   "assets": [
     "inkling2_mini",
     "datasets",
@@ -14,7 +15,7 @@
   "seq_len": 256,
   "n_diag": 4,
   "n_calib_a": 12,
-  "n_calib_b": 6,
+  "n_calib_b": 12,
   "n_eval": 64,
   "mcq_limits": {
     "arc_challenge": 1172,
