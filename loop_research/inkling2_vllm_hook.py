@@ -171,11 +171,13 @@ def _build_general_triton_route():
         _group_sum,
         _load_bias,
         _local_experts,
+        _log_sigmoid,
         _place_experts,
         _quantize_x,
         _row_scales,
         _selection_keys,
         _store_x,
+        _sum8,
     )
     from vllm.models.inkling2.nvidia.ops.trtllm_bmm import ExpertPlan, operand
 
@@ -234,16 +236,25 @@ def _build_general_triton_route():
             keys = tl.where(keys == best, 0, keys)
 
         selected_logits = _group_sum(Partials, rows, ids_base, ids_base >= 0, T, E, GROUPS)
-        probs_base = tl.div_rn(1.0, 1.0 + tldevice.exp(-selected_logits))  # [1, K_BASE]
-        sum_base = tl.sum(probs_base, 1)                                   # [1]
-        sum_kept = tl.sum(tl.where(slots_base < TOPK, probs_base, 0.0), 1) # [1]
-
+        # Exact underflow-proof log-space normalization matching vLLM's `_routing_weights(_log_sigmoid(...))`!
+        log_probs = _log_sigmoid(selected_logits)  # [1, K_BASE], always <= 0
         if SHRINK_NOREN:
-            denom = sum_base[:, None] + 1e-20
-            weights_base = (probs_base / denom) * (route_scale * gamma_scale)
+            max_lp = tl.max(log_probs, 1)
+            shifted = tldevice.exp(log_probs - max_lp[:, None])
+            total_base = _sum8(shifted) if K_BASE == 8 else tl.sum(shifted, 1)
+            logsumexp = max_lp + tldevice.log(total_base)
+            weights_base = tldevice.exp(log_probs - logsumexp[:, None]) * (route_scale * gamma_scale)
         else:
-            denom = sum_kept[:, None] + 1e-20
-            weights_base = (probs_base / denom) * route_scale
+            kept_lp = tl.where(slots_base < TOPK, log_probs, float("-inf"))
+            max_kept = tl.max(kept_lp, 1)
+            shifted_kept = tl.where(slots_base < TOPK, tldevice.exp(kept_lp - max_kept[:, None]), 0.0)
+            total_kept = _sum8(shifted_kept) if (TOPK == 8 and K_BASE == 8) else tl.sum(shifted_kept, 1)
+            logsumexp_kept = max_kept + tldevice.log(total_kept)
+            weights_base = tl.where(
+                slots_base < TOPK,
+                tldevice.exp(kept_lp - logsumexp_kept[:, None]) * route_scale,
+                0.0,
+            )
 
         # Slice to [1, TOPK_POW2] and mask slots >= TOPK to local=-1
         # Since K_BASE == 8 >= TOPK_POW2, extract slots [0..TOPK_POW2-1] cleanly
@@ -452,8 +463,8 @@ def _compute_desc_top8_weights_pytorch(
     scores = torch.sigmoid(logits)
     sel = scores + gate_bias.float().unsqueeze(0)
     _, ids_desc = torch.topk(sel, k=k_base, dim=-1, largest=True, sorted=True)
-    p_desc = scores.gather(1, ids_desc)
-    w_desc = (p_desc / (p_desc.sum(dim=-1, keepdim=True) + 1e-20)) * float(route_scale)
+    log_p = torch.nn.functional.logsigmoid(logits.gather(1, ids_desc))
+    w_desc = torch.softmax(log_p, dim=-1) * float(route_scale)
     return ids_desc, w_desc
 
 
